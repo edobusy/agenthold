@@ -2,8 +2,8 @@
 Storage layer for agenthold.
 
 Schema:
-  state_records: current live state, one row per namespace/key
-  state_history: append-only log of every write
+  state_records : current live state, one row per namespace/key
+  state_history : append-only log of every write
 
 Write order (atomic within a transaction):
   1. INSERT into state_history
