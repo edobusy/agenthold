@@ -23,6 +23,7 @@ Add to your MCP client config:
 
 import argparse
 import asyncio
+import json
 import threading
 from pathlib import Path
 from typing import Any
@@ -43,8 +44,8 @@ def make_server(db_path: str | Path) -> Server:
     store = StateStore(db_path)
     server = Server("agenthold")
 
-    @server.list_tools()
-    async def list_tools() -> list[Tool]:
+    @server.list_tools()  # type: ignore[no-untyped-call, untyped-decorator]
+    async def list_tools() -> list[Tool]:  # pragma: no cover
         return [
             Tool(
                 name="agenthold_get",
@@ -59,7 +60,9 @@ def make_server(db_path: str | Path) -> Server:
                     "properties": {
                         "namespace": {
                             "type": "string",
-                            "description": "Workflow or resource identifier, e.g. 'order-1234'",
+                            "description": (
+                                "Workflow or resource identifier, e.g. 'order-1234'"
+                            ),
                         },
                         "key": {
                             "type": "string",
@@ -89,7 +92,9 @@ def make_server(db_path: str | Path) -> Server:
                         },
                         "updated_by": {
                             "type": "string",
-                            "description": "Your agent identifier, e.g. 'inventory-agent'",
+                            "description": (
+                                "Your agent identifier, e.g. 'inventory-agent'"
+                            ),
                         },
                         "expected_version": {
                             "type": "integer",
@@ -136,11 +141,13 @@ def make_server(db_path: str | Path) -> Server:
             ),
         ]
 
-    @server.call_tool()
-    async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+    @server.call_tool()  # type: ignore[untyped-decorator]
+    async def call_tool(  # pragma: no cover
+        name: str, arguments: dict[str, Any]
+    ) -> list[TextContent]:
         result = _dispatch(store, name, arguments)
-        import json
-        return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+        text = json.dumps(result, indent=2, default=str)
+        return [TextContent(type="text", text=text)]
 
     return server
 
@@ -218,7 +225,7 @@ def _dispatch(store: StateStore, name: str, args: dict[str, Any]) -> dict[str, A
             }
 
         elif name == "agenthold_history":
-            records = store.history(
+            history_records = store.history(
                 args["namespace"],
                 args["key"],
                 limit=args.get("limit", 10),
@@ -234,7 +241,7 @@ def _dispatch(store: StateStore, name: str, args: dict[str, Any]) -> dict[str, A
                         "updated_by": r.updated_by,
                         "updated_at": r.updated_at.isoformat(),
                     }
-                    for r in records
+                    for r in history_records
                 ],
             }
 
@@ -242,13 +249,14 @@ def _dispatch(store: StateStore, name: str, args: dict[str, Any]) -> dict[str, A
             return {"status": "error", "message": f"Unknown tool: {name}"}
 
 
-async def _run_server(db_path: str | Path) -> None:
+async def _run_server(db_path: str | Path) -> None:  # pragma: no cover
     server = make_server(db_path)
     async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
+        init_options = server.create_initialization_options()
+        await server.run(read_stream, write_stream, init_options)
 
 
-def main() -> None:
+def main() -> None:  # pragma: no cover
     parser = argparse.ArgumentParser(description="Agenthold MCP server")
     parser.add_argument(
         "--db",
@@ -259,5 +267,5 @@ def main() -> None:
     asyncio.run(_run_server(args.db))
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     main()

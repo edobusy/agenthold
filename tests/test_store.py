@@ -1,4 +1,4 @@
-"""Unit tests for the StateStore (step 2.2)."""
+"""Unit tests for the StateStore."""
 
 from datetime import datetime
 
@@ -7,7 +7,6 @@ import pytest
 from agenthold.exceptions import ConflictError, NotFoundError
 from agenthold.models import SetResult, StateRecord, StateRecordHistory
 from agenthold.store import StateStore
-
 
 # ---------------------------------------------------------------------------
 # get
@@ -271,3 +270,8 @@ def test_set_and_get_none_value(store: StateStore) -> None:
 def test_set_and_get_boolean_value(store: StateStore) -> None:
     store.set("ns", "k", True, updated_by="a")
     assert store.get("ns", "k").value is True
+
+
+def test_close_does_not_raise() -> None:
+    store = StateStore(":memory:")
+    store.close()  # should complete without error

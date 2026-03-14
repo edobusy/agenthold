@@ -18,10 +18,10 @@ Conflict detection uses optimistic concurrency control (OCC):
 
 import json
 import sqlite3
+from collections.abc import Generator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Generator
 
 from agenthold.exceptions import ConflictError, NotFoundError
 from agenthold.models import (
@@ -58,13 +58,12 @@ CREATE INDEX IF NOT EXISTS idx_history_ns_key
 
 
 class StateStore:
-
     def __init__(self, db_path: str | Path = ":memory:") -> None:
         self.db_path = str(db_path)
         self._conn = sqlite3.connect(
             self.db_path,
-            check_same_thread=False, # we guard with a lock in the server
-            isolation_level=None, # autocommit off, we manage transactions
+            check_same_thread=False,  # we guard with a lock in the server
+            isolation_level=None,  # autocommit off, we manage transactions
         )
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -82,7 +81,7 @@ class StateStore:
             raise
 
     def _now(self) -> str:
-        return datetime.now(timezone.utc).isoformat()
+        return datetime.now(UTC).isoformat()
 
     def get(self, namespace: str, key: str) -> StateRecord:
         """Return the current state record. Raises NotFoundError if absent."""
@@ -139,9 +138,9 @@ class StateStore:
                         expected_version=expected_version,
                         actual_version=current_version,
                         updated_by=existing["updated_by"] if existing else "",
-                        updated_at=datetime.fromisoformat(
-                            existing["updated_at"]
-                        ) if existing else datetime.now(timezone.utc),
+                        updated_at=datetime.fromisoformat(existing["updated_at"])
+                        if existing
+                        else datetime.now(UTC),
                     )
                 )
 

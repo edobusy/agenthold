@@ -11,6 +11,7 @@ class ConflictError(AgentholdError):
     the current version. This is optimistic concurrency control,
     the same mechanism as Postgres's UPDATE ... WHERE version = N.
     """
+
     def __init__(self, detail: ConflictDetail) -> None:
         self.detail = detail
         super().__init__(
@@ -22,6 +23,7 @@ class ConflictError(AgentholdError):
 
 class NotFoundError(AgentholdError):
     """Raised when a key does not exist in the given namespace."""
+
     def __init__(self, namespace: str, key: str) -> None:
         self.namespace = namespace
         self.key = key
