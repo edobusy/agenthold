@@ -8,8 +8,8 @@ class AgentholdError(Exception):
 class ConflictError(AgentholdError):
     """
     Raised when a write fails because expected_version does not match
-    the current version. This is optimistic concurrency control, the
-    same mechanism as Postgres's UPDATE ... WHERE version = N.
+    the current version. This is optimistic concurrency control,
+    the same mechanism as Postgres's UPDATE ... WHERE version = N.
     """
     def __init__(self, detail: ConflictDetail) -> None:
         self.detail = detail
