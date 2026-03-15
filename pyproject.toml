@@ -7,7 +7,7 @@ packages = ["src/agenthold"]
 
 [project]
 name = "agenthold"
-version = "0.1.0"
+version = "0.1.1"
 description = "Shared versioned state for multi-agent AI workflows"
 readme = "README.md"
 license = { text = "MIT" }
