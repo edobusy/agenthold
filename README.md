@@ -164,7 +164,15 @@ Write a value. Pass `expected_version` to enable conflict detection.
 }
 ```
 
-Omit `expected_version` to write unconditionally (useful for first writes or deliberate overwrites).
+**`expected_version` patterns:**
+
+| Value | Behaviour |
+|---|---|
+| Omitted | Unconditional write — overwrites any concurrent change without warning |
+| `0` | Create-only guard — succeeds only if the key does not yet exist; conflicts if it does |
+| `N` (from a prior `agenthold_get`) | Conflict-safe write — rejected if another agent wrote since your read |
+
+Pass `expected_version=0` when initialising shared state that should only be written once. Omit it only for deliberate unconditional overwrites.
 
 ---
 
@@ -193,7 +201,7 @@ List all current state records in a namespace.
 
 ### `agenthold_history`
 
-Read the version history of a state record, newest first. Useful for debugging coordination issues.
+Read the version history of a state record, newest first. Useful for debugging coordination issues and auditing writes.
 
 ```json
 {
@@ -209,12 +217,14 @@ Read the version history of a state record, newest first. Useful for debugging c
   "namespace": "order-1234",
   "key": "status",
   "history": [
-    { "version": 3, "value": "processing",  "updated_by": "fulfillment-agent", "updated_at": "..." },
-    { "version": 2, "value": "validated",   "updated_by": "validation-agent",  "updated_at": "..." },
-    { "version": 1, "value": "received",    "updated_by": "intake-agent",      "updated_at": "..." }
+    { "version": 3, "value": "processing",  "updated_by": "fulfillment-agent", "updated_at": "...", "event_type": "write" },
+    { "version": 2, "value": "validated",   "updated_by": "validation-agent",  "updated_at": "...", "event_type": "write" },
+    { "version": 1, "value": "received",    "updated_by": "intake-agent",      "updated_at": "...", "event_type": "write" }
   ]
 }
 ```
+
+Each entry includes an `event_type` field: `"write"` for normal writes, `"delete"` for deletion events. Delete tombstones have `value: null`. An empty history list means no writes have been recorded for this key — the key may not exist. Use `agenthold_get` to check current state.
 
 ---
 
@@ -328,13 +338,13 @@ CI runs on Python 3.11 and 3.12 on every push to `main`.
 These notes are here for engineers who want to understand the design decisions.
 
 **Why SQLite?**
-SQLite is the right tool for this scope. It is zero-dependency, ships in the Python stdlib, runs everywhere, and supports WAL mode which gives concurrent read performance without a separate server process. Postgres adds an ops dependency with no benefit at this scale. The storage backend is behind a clean interface (`StateStore`) that can be swapped for Postgres when the need arises. Choosing a simple tool deliberately is not a limitation.
+SQLite is the right tool for this scope. It is zero-dependency, ships in the Python stdlib, and runs everywhere. WAL mode is enabled for forward-compatibility; the current implementation serialises all reads and writes through a single lock. Postgres adds an ops dependency with no benefit at this scale. The storage backend is behind a clean interface (`StateStore`) that can be swapped for Postgres when the need arises. Choosing a simple tool deliberately is not a limitation.
 
 **Why OCC instead of pessimistic locking?**
 Locks require the holder to release them, which means the system must handle crashes, timeouts, and stale holders. That complexity is not worth it when conflicts are rare. OCC pays a cost only when a conflict actually occurs: one extra read and one retry. For multi-agent workflows where agents do significant work between reads and writes (LLM inference, API calls, tool execution), OCC is the correct choice.
 
 **What the versioning guarantees:**
-Each key has a version that starts at 1 and increments by exactly 1 on every write. The `state_history` table is append-only and records every write before the live record is updated, so a crash between the two writes leaves history consistent. The ordering guarantee is per-key, not global; two different keys can have their versions updated in any order.
+Each key has a version that starts at 1 and increments by exactly 1 on every write. The `state_history` table is append-only and records every write before the live record is updated, so a crash between the two writes leaves history consistent. Deletions also write a tombstone entry to `state_history` (with `event_type: "delete"`) before removing the live record, so the full lifecycle of a key is visible in history. The ordering guarantee is per-key, not global; two different keys can have their versions updated in any order.
 
 **What would change for production scale:**
 Three things. First, replace SQLite with Postgres: better concurrent write throughput, replication, and managed hosting. The `StateStore` interface is already designed to make this a contained change. Second, add authentication: the current server trusts any caller on the stdio transport. A production deployment needs at minimum an API key check. Third, add the HTTP transport: the MCP SDK supports `StreamableHTTPServer`, which would let remote agents connect over the network instead of requiring a local process.
