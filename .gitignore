@@ -212,3 +212,6 @@ plan.md
 
 # DB
 *.db
+
+# Claude
+.claude/

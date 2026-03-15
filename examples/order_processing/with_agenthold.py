@@ -1,9 +1,12 @@
 """
-Demonstrates coordinated multi-agent state using Agenthold.
+With Agenthold — conflict-safe shared state.
 
-The same two agents process the same order concurrently. When a conflict
-is detected, the losing agent re-reads the current state and retries.
-The final state is correct and deterministic regardless of scheduling.
+The same two agents process the same order at the same time. Each agent
+passes expected_version when writing to a shared field. If another agent
+has written since its read, a ConflictError is raised instead of silently
+overwriting. The losing agent re-reads the current state and retries.
+
+The final state is always correct regardless of which agent runs first.
 """
 
 import threading
@@ -24,78 +27,62 @@ def setup_order() -> None:
 
 
 def inventory_agent() -> None:
-    """Reserves stock using read-modify-write with conflict detection."""
-    log.append("inventory-agent: reading current order state")
-    time.sleep(0.05)
+    time.sleep(0.05)    # check warehouse availability
 
     retries = 0
     while True:
-        status_record = store.get("ORD-7829", "status")
+        status = store.get("ORD-7829", "status")
         try:
             store.set("ORD-7829", "reserved", True, updated_by="inventory-agent")
             store.set(
-                "ORD-7829",
-                "status",
-                "processing",
+                "ORD-7829", "status", "processing",
                 updated_by="inventory-agent",
-                expected_version=status_record.version,
+                expected_version=status.version,    # reject write if status changed
             )
-            log.append(
-                f"inventory-agent: wrote reserved=True, status=processing"
-                f" (after {retries} retries)"
-            )
+            suffix = f"  (after {retries} retries)" if retries else ""
+            log.append(f"[inventory] wrote: reserved=True, status='processing'{suffix}")
             break
         except ConflictError as e:
             retries += 1
             log.append(
-                f"inventory-agent: conflict on status"
-                f" (expected v{e.detail.expected_version},"
-                f" got v{e.detail.actual_version}"
-                f" by {e.detail.updated_by}) — retrying"
+                f"[inventory] CONFLICT: status is now v{e.detail.actual_version}"
+                f" (written by {e.detail.updated_by}) -- re-reading and retrying"
             )
             time.sleep(0.01)
 
 
 def pricing_agent() -> None:
-    """Applies discount using read-modify-write with conflict detection."""
-    log.append("pricing-agent: reading current order state")
-    time.sleep(0.05)
-
-    # Compute discount once from the original price before any retries.
-    # total and discount_applied are only written by this agent, so those
-    # writes are unconditional; only status races with inventory-agent.
-    new_total = round(store.get("ORD-7829", "total").value * 0.9, 2)
+    time.sleep(0.05)    # fetch pricing rules
 
     retries = 0
+    new_total: float | None = None
     while True:
-        status_record = store.get("ORD-7829", "status")
+        status = store.get("ORD-7829", "status")
+        total = store.get("ORD-7829", "total")
+        if new_total is None:
+            # Compute the discount once from the original price.
+            # Keeping new_total fixed across retries ensures the 10% is
+            # applied exactly once even if the status write fails and retries.
+            new_total = round(total.value * 0.9, 2)
         try:
+            store.set("ORD-7829", "discount_applied", True, updated_by="pricing-agent")
+            store.set("ORD-7829", "total", new_total, updated_by="pricing-agent")
             store.set(
-                "ORD-7829", "discount_applied", True, updated_by="pricing-agent"
-            )
-            store.set(
-                "ORD-7829", "total", new_total, updated_by="pricing-agent"
-            )
-            store.set(
-                "ORD-7829",
-                "status",
-                "awaiting_payment",
+                "ORD-7829", "status", "awaiting_payment",
                 updated_by="pricing-agent",
-                expected_version=status_record.version,
+                expected_version=status.version,    # reject write if status changed
             )
+            suffix = f"  (after {retries} retries)" if retries else ""
             log.append(
-                f"pricing-agent: wrote discount_applied=True,"
-                f" total={new_total}, status=awaiting_payment"
-                f" (after {retries} retries)"
+                f"[pricing]   wrote: discount_applied=True,"
+                f" total={new_total}, status='awaiting_payment'{suffix}"
             )
             break
         except ConflictError as e:
             retries += 1
             log.append(
-                f"pricing-agent: conflict on {e.detail.key}"
-                f" (expected v{e.detail.expected_version},"
-                f" got v{e.detail.actual_version}"
-                f" by {e.detail.updated_by}) — retrying"
+                f"[pricing]   CONFLICT: status is now v{e.detail.actual_version}"
+                f" (written by {e.detail.updated_by}) -- re-reading and retrying"
             )
             time.sleep(0.01)
 
@@ -103,13 +90,11 @@ def pricing_agent() -> None:
 def main() -> None:
     setup_order()
 
-    print("ORDER STATE AT START:")
-    for record in store.list_keys("ORD-7829"):
-        print(
-            f"  {record.key}: {record.value}"
-            f" (v{record.version})"
-        )
+    print("Order ORD-7829 received (every value is versioned from first write):")
+    for r in store.list_keys("ORD-7829"):
+        print(f"  {r.key}={r.value!r}  (v{r.version})")
     print()
+    print("inventory-agent and pricing-agent start simultaneously...")
 
     t1 = threading.Thread(target=inventory_agent)
     t2 = threading.Thread(target=pricing_agent)
@@ -118,26 +103,20 @@ def main() -> None:
     t1.join()
     t2.join()
 
-    print("EVENT LOG:")
+    print()
     for entry in log:
         print(f"  {entry}")
-    print()
 
-    print("FINAL STATE:")
-    for record in store.list_keys("ORD-7829"):
-        print(
-            f"  {record.key}: {record.value}"
-            f" (v{record.version}, by {record.updated_by})"
-        )
     print()
+    print("Final state (each field records who last wrote it):")
+    for r in store.list_keys("ORD-7829"):
+        print(f"  {r.key}={r.value!r}  (v{r.version}, by {r.updated_by})")
 
-    print("VERSION HISTORY (status key):")
+    print()
+    print("Audit trail for 'status' -- agenthold records every write:")
     for h in store.history("ORD-7829", "status"):
-        print(f"  v{h.version}: {h.value} — written by {h.updated_by}")
-    print()
+        print(f"  v{h.version}: {h.value!r}  written by {h.updated_by}")
 
-    # Verify correctness
-    status = store.get("ORD-7829", "status")
     reserved = store.get("ORD-7829", "reserved")
     discount = store.get("ORD-7829", "discount_applied")
     total = store.get("ORD-7829", "total")
@@ -145,7 +124,9 @@ def main() -> None:
     assert reserved.value is True, "reserved should be True"
     assert discount.value is True, "discount_applied should be True"
     assert total.value == round(89.99 * 0.9, 2), "total should be discounted"
-    print("RESULT: All assertions passed. State is correct and deterministic.")
+
+    print()
+    print("RESULT: Both agents completed. No silent overwrites. State is always correct.")
 
 
 if __name__ == "__main__":

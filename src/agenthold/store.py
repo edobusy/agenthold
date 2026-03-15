@@ -18,6 +18,7 @@ Conflict detection uses optimistic concurrency control (OCC):
 
 import json
 import sqlite3
+import threading
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -60,9 +61,10 @@ CREATE INDEX IF NOT EXISTS idx_history_ns_key
 class StateStore:
     def __init__(self, db_path: str | Path = ":memory:") -> None:
         self.db_path = str(db_path)
+        self._lock = threading.Lock()
         self._conn = sqlite3.connect(
             self.db_path,
-            check_same_thread=False,  # we guard with a lock in the server
+            check_same_thread=False,
             isolation_level=None,  # autocommit off, we manage transactions
         )
         self._conn.row_factory = sqlite3.Row
@@ -72,23 +74,25 @@ class StateStore:
 
     @contextmanager
     def _transaction(self) -> Generator[sqlite3.Connection, None, None]:
-        self._conn.execute("BEGIN")
-        try:
-            yield self._conn
-            self._conn.execute("COMMIT")
-        except Exception:
-            self._conn.execute("ROLLBACK")
-            raise
+        with self._lock:
+            self._conn.execute("BEGIN")
+            try:
+                yield self._conn
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def _now(self) -> str:
         return datetime.now(UTC).isoformat()
 
     def get(self, namespace: str, key: str) -> StateRecord:
         """Return the current state record. Raises NotFoundError if absent."""
-        row = self._conn.execute(
-            "SELECT * FROM state_records WHERE namespace = ? AND key = ?",
-            (namespace, key),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM state_records WHERE namespace = ? AND key = ?",
+                (namespace, key),
+            ).fetchone()
         if row is None:
             raise NotFoundError(namespace, key)
         return StateRecord(
@@ -174,10 +178,11 @@ class StateStore:
 
     def list_keys(self, namespace: str) -> list[StateRecord]:
         """Return all current records in a namespace."""
-        rows = self._conn.execute(
-            "SELECT * FROM state_records WHERE namespace = ? ORDER BY key",
-            (namespace,),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM state_records WHERE namespace = ? ORDER BY key",
+                (namespace,),
+            ).fetchall()
         return [
             StateRecord(
                 namespace=r["namespace"],
@@ -194,12 +199,13 @@ class StateStore:
         self, namespace: str, key: str, limit: int = 10
     ) -> list[StateRecordHistory]:
         """Return the last N versions of a record, newest first."""
-        rows = self._conn.execute(
-            "SELECT * FROM state_history "
-            "WHERE namespace = ? AND key = ? "
-            "ORDER BY version DESC LIMIT ?",
-            (namespace, key, limit),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM state_history "
+                "WHERE namespace = ? AND key = ? "
+                "ORDER BY version DESC LIMIT ?",
+                (namespace, key, limit),
+            ).fetchall()
         return [
             StateRecordHistory(
                 namespace=r["namespace"],
