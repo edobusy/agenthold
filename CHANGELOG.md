@@ -7,6 +7,22 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.5] - 2026-03-16
+
+### Added
+- `agenthold_watch` MCP tool: blocks until a key's version exceeds `since_version`,
+  then returns the new record. Polls every 200 ms. Returns `{"status": "timeout"}`
+  with a `hint` if the key does not change within `timeout_seconds` (default 10 s).
+- `_watch()` module-level async function in `server.py`; routed directly from
+  `call_tool` rather than through `_dispatch`, keeping the synchronous dispatch
+  path unmodified
+- `ASYNC_TOOLS` constant in `test_server.py` as a static record of tools that
+  bypass `_dispatch`; guarded by `test_async_tools_are_not_handled_by_dispatch`
+- Full test suite for `_watch` in `tests/test_watch.py` (Groups 1–6: immediate
+  return, polling, timeout, input validation, response format, isolation)
+
+---
+
 ## [0.1.4] - 2026-03-15
 
 ### Added

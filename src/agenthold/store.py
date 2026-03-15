@@ -151,11 +151,11 @@ class StateStore:
         first writes or deliberate overwrites).
         """
         value_json = json.dumps(value)
-        now = self._now()
 
         with self._transaction() as conn:
+            now = self._now()
             existing = conn.execute(
-                "SELECT version, updated_by, updated_at "
+                "SELECT version, updated_by, updated_at, value "
                 "FROM state_records WHERE namespace = ? AND key = ?",
                 (namespace, key),
             ).fetchone()
@@ -170,6 +170,9 @@ class StateStore:
                         key=key,
                         expected_version=expected_version,
                         actual_version=current_version,
+                        actual_value=json.loads(existing["value"])
+                        if existing
+                        else None,
                         updated_by=(
                             existing["updated_by"]
                             if existing
@@ -275,10 +278,10 @@ class StateStore:
         state_history recording deleted_by and the version that was deleted.
         The live record is removed. Prior history entries are preserved.
         """
-        now = self._now()
         with self._transaction() as conn:
+            now = self._now()
             existing = conn.execute(
-                "SELECT version, updated_by, updated_at FROM state_records "
+                "SELECT version, updated_by, updated_at, value FROM state_records "
                 "WHERE namespace = ? AND key = ?",
                 (namespace, key),
             ).fetchone()
@@ -295,6 +298,7 @@ class StateStore:
                         key=key,
                         expected_version=expected_version,
                         actual_version=current_version,
+                        actual_value=json.loads(existing["value"]),
                         updated_by=existing["updated_by"],
                         updated_at=datetime.fromisoformat(existing["updated_at"]),
                     )

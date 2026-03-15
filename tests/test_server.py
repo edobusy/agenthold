@@ -2,7 +2,7 @@
 
 import json
 
-from agenthold.server import _dispatch, make_server
+from agenthold.server import _dispatch, _watch, make_server
 from agenthold.store import StateStore
 
 EXPECTED_TOOLS = {
@@ -12,6 +12,8 @@ EXPECTED_TOOLS = {
     "agenthold_history",
     "agenthold_delete",
 }
+
+ASYNC_TOOLS = {"agenthold_watch"}
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +124,7 @@ def test_dispatch_set_conflict(store: StateStore) -> None:
     assert result["status"] == "conflict"
     assert result["expected_version"] == 0
     assert result["actual_version"] == 1
+    assert result["actual_value"] == "v1"
     assert result["actual_updated_by"] == "agent-a"
     assert "actual_updated_at" in result
     assert "hint" in result
@@ -179,6 +182,15 @@ def test_dispatch_history_with_limit(store: StateStore) -> None:
     )
     assert result["status"] == "ok"
     assert len(result["history"]) == 3
+
+
+def test_dispatch_history_invalid_limit(store: StateStore) -> None:
+    for limit in (0, -1, -100):
+        result = _dispatch(
+            store, "agenthold_history", {"namespace": "ns", "key": "k", "limit": limit}
+        )
+        assert result["status"] == "error", f"Expected error for limit={limit}"
+        assert "limit" in result["message"]
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +284,7 @@ def test_dispatch_delete_conflict(store: StateStore) -> None:
     assert result["status"] == "conflict"
     assert result["expected_version"] == 1
     assert result["actual_version"] == 2
+    assert result["actual_value"] == "v2"
     assert "hint" in result
     assert "message" in result
 
@@ -286,3 +299,24 @@ def test_dispatch_delete_tombstone_visible_in_history(store: StateStore) -> None
     result = _dispatch(store, "agenthold_history", {"namespace": "ns", "key": "k"})
     assert result["history"][0]["event_type"] == "delete"
     assert result["history"][0]["updated_by"] == "cleanup"
+
+
+# ---------------------------------------------------------------------------
+# Async tool routing split guard
+# ---------------------------------------------------------------------------
+
+
+def test_async_tools_are_not_handled_by_dispatch() -> None:
+    """Tools routed through call_tool (not _dispatch) must return status='error'
+    from _dispatch, confirming the routing split is intentional."""
+    store = StateStore(":memory:")
+    for tool_name in ASYNC_TOOLS:
+        result = _dispatch(store, tool_name, {})
+        assert result.get("status") == "error", (
+            f"Tool '{tool_name}' should NOT be handled by _dispatch"
+        )
+
+
+async def test_watch_is_importable() -> None:
+    """_watch must be importable as a module-level function."""
+    assert callable(_watch)

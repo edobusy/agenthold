@@ -41,5 +41,6 @@ class ConflictDetail(BaseModel):
     key: str
     expected_version: int  # what the agent thought the version was
     actual_version: int  # what it actually is
+    actual_value: Any  # current value; None if key does not exist
     updated_by: str  # who wrote the conflicting version
     updated_at: datetime

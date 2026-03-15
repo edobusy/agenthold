@@ -185,6 +185,7 @@ def test_conflict_error_detail_is_conflict_detail_model(store: StateStore) -> No
     assert detail.key == "key"
     assert detail.expected_version == 1
     assert detail.actual_version == 2
+    assert detail.actual_value == "v2"
     assert detail.updated_by == "b"
     assert isinstance(detail.updated_at, datetime)
 
@@ -233,6 +234,7 @@ def test_conflict_on_nonexistent_key_with_expected_version(store: StateStore) ->
     # actual_version is 0 because the key doesn't exist
     assert exc_info.value.detail.actual_version == 0
     assert exc_info.value.detail.expected_version == 1
+    assert exc_info.value.detail.actual_value is None
 
 
 def test_conflict_on_nonexistent_key_updated_by_descriptive(store: StateStore) -> None:

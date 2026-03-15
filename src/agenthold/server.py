@@ -1,11 +1,13 @@
 """
 Agenthold MCP server.
 
-Exposes four tools over the Model Context Protocol:
+Exposes six tools over the Model Context Protocol:
   agenthold_get : read a state record
   agenthold_set : write a state record (with optional conflict detection)
   agenthold_list : list all keys in a namespace
   agenthold_history : read the version history of a key
+  agenthold_delete : permanently delete a state record
+  agenthold_watch : wait for a key's version to change
 
 Usage:
   agenthold --db ./state.db
@@ -24,6 +26,7 @@ Add to your MCP client config:
 import argparse
 import asyncio
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -59,7 +62,10 @@ def make_server(db_path: str | Path) -> Server:
                     "Always pass the returned version as expected_version in a "
                     "subsequent agenthold_set call to enable conflict detection. "
                     "If you omit expected_version in agenthold_set, your write will "
-                    "silently overwrite any concurrent changes without warning."
+                    "silently overwrite any concurrent changes without warning. "
+                    "If the key does not exist, the response has status 'not_found' "
+                    "with no version — use expected_version=0 in agenthold_set to "
+                    "write only if the key is still absent."
                 ),
                 inputSchema={
                     "type": "object",
@@ -81,7 +87,11 @@ def make_server(db_path: str | Path) -> Server:
                     "Pass expected_version=0 to write only if the key does not "
                     "yet exist (create-only guard). "
                     "Omit expected_version entirely to write unconditionally, "
-                    "overwriting any concurrent changes without warning."
+                    "overwriting any concurrent changes without warning. "
+                    "On success, the response includes the new version — use it "
+                    "directly as expected_version for subsequent writes without "
+                    "calling agenthold_get again. "
+                    "previous_version is null for the first write to a key."
                 ),
                 inputSchema={
                     "type": "object",
@@ -138,7 +148,9 @@ def make_server(db_path: str | Path) -> Server:
                     "this key — this does not confirm the key exists. "
                     "Use agenthold_get to check current state. "
                     "Each entry includes an event_type field: 'write' for "
-                    "normal writes, 'delete' for deletion events."
+                    "normal writes, 'delete' for deletion events. "
+                    "If the response contains exactly limit entries, more history "
+                    "may exist — pass a larger limit to see further back."
                 ),
                 inputSchema={
                     "type": "object",
@@ -147,8 +159,9 @@ def make_server(db_path: str | Path) -> Server:
                         "key": _KEY_FIELD,
                         "limit": {
                             "type": "integer",
-                            "description": "Max versions to return (default 10)",
+                            "description": "Max versions to return (default 10, min 1)",
                             "default": 10,
+                            "minimum": 1,
                         },
                     },
                     "required": ["namespace", "key"],
@@ -183,11 +196,59 @@ def make_server(db_path: str | Path) -> Server:
                             "description": (
                                 "The version you last read. If the stored version "
                                 "has changed since your read, the delete will be "
-                                "rejected with a conflict response."
+                                "rejected with a conflict response. "
+                                "Do not pass 0 — unlike agenthold_set, version 0 "
+                                "means the key does not exist and any live key "
+                                "will always conflict."
                             ),
                         },
                     },
                     "required": ["namespace", "key", "deleted_by"],
+                },
+            ),
+            Tool(
+                name="agenthold_watch",
+                description=(
+                    "Wait for a key's version to change, then return the new value. "
+                    "Polls every 200 ms. Returns when version exceeds since_version, "
+                    'or returns {"status": "timeout"} with a hint if nothing changed '
+                    "within timeout_seconds. "
+                    "IMPORTANT: This call holds the agent turn until it returns — no "
+                    "other actions can be taken while waiting. Only use this when the "
+                    "agent has nothing else to do until the key changes. "
+                    "Use since_version=0 to wait for a key that does not exist yet. "
+                    "On timeout, read the hint field for guidance on next steps. "
+                    "Warning: if a key is deleted and recreated, its version restarts "
+                    "at 1; a watch with since_version >= 1 will not fire on recreation "
+                    "— call agenthold_get after timeout to check current state."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "namespace": _NS_FIELD,
+                        "key": _KEY_FIELD,
+                        "since_version": {
+                            "type": "integer",
+                            "description": (
+                                "Return when version exceeds this value. "
+                                "Pass the version you last read — from agenthold_get, "
+                                "agenthold_list, or an agenthold_set response. "
+                                "Use 0 to wait for the very first write to a key."
+                            ),
+                        },
+                        "timeout_seconds": {
+                            "type": "number",
+                            "default": 10.0,
+                            "description": (
+                                "Maximum seconds to wait (default 10). "
+                                "Pass a larger value if the writing agent may take "
+                                "longer. 0 returns immediately after one check. "
+                                "Actual wait may exceed this by up to 200ms due "
+                                "to the polling interval."
+                            ),
+                        },
+                    },
+                    "required": ["namespace", "key", "since_version"],
                 },
             ),
         ]
@@ -196,9 +257,17 @@ def make_server(db_path: str | Path) -> Server:
     async def call_tool(  # pragma: no cover
         name: str, arguments: dict[str, Any]
     ) -> list[TextContent]:
-        result = _dispatch(store, name, arguments)
-        text = json.dumps(result, indent=2)
-        return [TextContent(type="text", text=text)]
+        if name == "agenthold_watch":
+            result = await _watch(
+                store,
+                namespace=arguments["namespace"],
+                key=arguments["key"],
+                since_version=int(arguments["since_version"]),
+                timeout_seconds=float(arguments.get("timeout_seconds", 10.0)),
+            )
+        else:
+            result = _dispatch(store, name, arguments)
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
     return server
 
@@ -231,7 +300,11 @@ def _dispatch(store: StateStore, name: str, args: dict[str, Any]) -> dict[str, A
                 key=args["key"],
                 value=args["value"],
                 updated_by=args["updated_by"],
-                expected_version=args.get("expected_version"),
+                expected_version=(
+                    int(args["expected_version"])
+                    if "expected_version" in args
+                    else None
+                ),
             )
             return {
                 "status": "ok",
@@ -248,11 +321,13 @@ def _dispatch(store: StateStore, name: str, args: dict[str, Any]) -> dict[str, A
                 "key": e.detail.key,
                 "expected_version": e.detail.expected_version,
                 "actual_version": e.detail.actual_version,
+                "actual_value": e.detail.actual_value,
                 "actual_updated_by": e.detail.updated_by,
                 "actual_updated_at": e.detail.updated_at.isoformat(),
                 "hint": (
-                    "Call agenthold_get to read the current state, "
-                    "merge your changes, and retry with the new version."
+                    "The current value is in actual_value. "
+                    "Merge your changes with it and retry "
+                    "with expected_version=actual_version."
                 ),
             }
 
@@ -275,10 +350,13 @@ def _dispatch(store: StateStore, name: str, args: dict[str, Any]) -> dict[str, A
         }
 
     elif name == "agenthold_history":
+        limit = int(args.get("limit", 10))
+        if limit < 1:
+            return {"status": "error", "message": "limit must be >= 1"}
         history_records = store.history(
             args["namespace"],
             args["key"],
-            limit=args.get("limit", 10),
+            limit=limit,
         )
         return {
             "status": "ok",
@@ -302,7 +380,11 @@ def _dispatch(store: StateStore, name: str, args: dict[str, Any]) -> dict[str, A
                 namespace=args["namespace"],
                 key=args["key"],
                 deleted_by=args["deleted_by"],
-                expected_version=args.get("expected_version"),
+                expected_version=(
+                    int(args["expected_version"])
+                    if "expected_version" in args
+                    else None
+                ),
             )
             if deleted_version is None:
                 return {
@@ -325,16 +407,68 @@ def _dispatch(store: StateStore, name: str, args: dict[str, Any]) -> dict[str, A
                 "key": e.detail.key,
                 "expected_version": e.detail.expected_version,
                 "actual_version": e.detail.actual_version,
+                "actual_value": e.detail.actual_value,
                 "actual_updated_by": e.detail.updated_by,
                 "actual_updated_at": e.detail.updated_at.isoformat(),
                 "hint": (
-                    "Call agenthold_get to read the current state "
-                    "and decide whether to proceed with deletion."
+                    "The current value is in actual_value. "
+                    "Inspect it and retry the delete "
+                    "with expected_version=actual_version."
                 ),
             }
 
     else:
         return {"status": "error", "message": f"Unknown tool: {name}"}
+
+
+async def _watch(
+    store: StateStore,
+    namespace: str,
+    key: str,
+    since_version: int,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    """Async polling loop. Called directly from call_tool, not via _dispatch."""
+    if since_version < 0:
+        return {"status": "error", "message": "since_version must be >= 0"}
+    if timeout_seconds < 0:
+        return {"status": "error", "message": "timeout_seconds must be >= 0"}
+
+    start = time.monotonic()
+    deadline = start + timeout_seconds
+
+    while True:
+        try:
+            record = store.get(namespace, key)
+            if record.version > since_version:
+                return {
+                    "status": "ok",
+                    "namespace": record.namespace,
+                    "key": record.key,
+                    "value": record.value,
+                    "version": record.version,
+                    "updated_by": record.updated_by,
+                    "updated_at": record.updated_at.isoformat(),
+                }
+        except NotFoundError:
+            pass  # version 0; keep waiting
+
+        now = time.monotonic()
+        if now >= deadline:
+            return {
+                "status": "timeout",
+                "namespace": namespace,
+                "key": key,
+                "since_version": since_version,
+                "elapsed_seconds": round(now - start, 3),
+                "hint": (
+                    "The key did not change within the timeout. "
+                    "Retry with the same since_version, or call agenthold_get "
+                    "to check current state before deciding whether to wait again."
+                ),
+            }
+
+        await asyncio.sleep(0.2)
 
 
 async def _run_server(db_path: str | Path) -> None:  # pragma: no cover

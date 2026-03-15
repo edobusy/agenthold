@@ -1,6 +1,6 @@
 """Agenthold : shared versioned state for multi-agent AI workflows."""
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 from agenthold.exceptions import ConflictError, NotFoundError
 from agenthold.models import SetResult, StateRecord, StateRecordHistory

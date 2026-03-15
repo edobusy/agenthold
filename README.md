@@ -96,7 +96,7 @@ except ConflictError as e:
 
 ## Tools
 
-agenthold exposes five tools over the Model Context Protocol.
+agenthold exposes six tools over the Model Context Protocol.
 
 ### `agenthold_get`
 
@@ -276,6 +276,57 @@ Permanently remove a state record. The deletion is written as a tombstone in `ag
 ```
 
 Pass `expected_version` (from a prior `agenthold_get`) to prevent accidentally deleting a record that was updated since your read. Omit it to delete unconditionally.
+
+---
+
+### `agenthold_watch`
+
+Wait for a key's version to change, then return the new value. Polls every 200 ms.
+
+> **Important:** This call holds the agent turn until it returns. No other actions can be taken while waiting. Only use this when the agent has nothing else to do until the key changes.
+
+```json
+{
+  "namespace": "pipeline",
+  "key": "step_1_result",
+  "since_version": 0,
+  "timeout_seconds": 30
+}
+```
+
+**Changed — key updated within timeout:**
+```json
+{
+  "status": "ok",
+  "namespace": "pipeline",
+  "key": "step_1_result",
+  "value": {"score": 0.92},
+  "version": 1,
+  "updated_by": "agent-a",
+  "updated_at": "2026-03-16T10:00:01.123456+00:00"
+}
+```
+
+**Timeout — nothing changed:**
+```json
+{
+  "status": "timeout",
+  "namespace": "pipeline",
+  "key": "step_1_result",
+  "since_version": 0,
+  "elapsed_seconds": 30.001,
+  "hint": "The key did not change within the timeout. Retry with the same since_version, or call agenthold_get to check current state before deciding whether to wait again."
+}
+```
+
+**`since_version` patterns:**
+
+| Value | Behaviour |
+|---|---|
+| `0` | Wait for the very first write to a key (fires when version reaches 1) |
+| `N` (from a prior `agenthold_get`) | Wait until the key has been updated beyond version N |
+
+Pass `timeout_seconds=0` to perform a single immediate check without sleeping — useful for an orchestrator that wants to know whether a key has changed between two other operations.
 
 ---
 
