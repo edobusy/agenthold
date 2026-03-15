@@ -3,7 +3,7 @@
 > Shared versioned state for multi-agent AI workflows.
 > An MCP server that gives your agents a consistent, conflict-safe ground truth.
 
-[![CI](https://github.com/your-github-username/agenthold/actions/workflows/ci.yml/badge.svg)](https://github.com/your-github-username/agenthold/actions/workflows/ci.yml)
+[![CI](https://github.com/edobusy/agenthold/actions/workflows/ci.yml/badge.svg)](https://github.com/edobusy/agenthold/actions/workflows/ci.yml)
 [![PyPI version](https://img.shields.io/pypi/v/agenthold)](https://pypi.org/project/agenthold/)
 [![Python 3.11+](https://img.shields.io/pypi/pyversions/agenthold)](https://pypi.org/project/agenthold/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -297,7 +297,7 @@ The database file is created automatically on first run. Back it up like any oth
 ## Development
 
 ```bash
-git clone https://github.com/your-github-username/agenthold.git
+git clone https://github.com/edobusy/agenthold.git
 cd agenthold
 uv sync --all-extras --dev
 ```

@@ -9,7 +9,7 @@ Thank you for your interest in contributing.
 You will need [uv](https://docs.astral.sh/uv/) to manage the Python environment.
 
 ```bash
-git clone https://github.com/your-github-username/agenthold.git
+git clone https://github.com/edobusy/agenthold.git
 cd agenthold
 uv sync --all-extras --dev
 ```
