@@ -115,7 +115,10 @@ def main() -> None:
     print()
     print("Audit trail for 'status' -- agenthold records every write:")
     for h in store.history("ORD-7829", "status"):
-        print(f"  v{h.version}: {h.value!r}  written by {h.updated_by}")
+        if h.event_type == "delete":
+            print(f"  v{h.version}: [deleted]  by {h.updated_by}")
+        else:
+            print(f"  v{h.version}: {h.value!r}  written by {h.updated_by}")
 
     reserved = store.get("ORD-7829", "reserved")
     discount = store.get("ORD-7829", "discount_applied")

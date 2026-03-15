@@ -10,6 +10,7 @@ EXPECTED_TOOLS = {
     "agenthold_set",
     "agenthold_list",
     "agenthold_history",
+    "agenthold_delete",
 }
 
 
@@ -36,7 +37,7 @@ def test_dispatch_output_is_json_serialisable() -> None:
 def test_dispatch_history_output_is_json_serialisable(store: StateStore) -> None:
     """History result including event_type must serialise cleanly."""
     store.set("ns", "k", "v1", updated_by="a")
-    store.delete("ns", "k")
+    store.delete("ns", "k", deleted_by="b")
     result = _dispatch(store, "agenthold_history", {"namespace": "ns", "key": "k"})
     text = json.dumps(result, indent=2)  # must not raise
     parsed = json.loads(text)
@@ -189,3 +190,99 @@ def test_dispatch_unknown_tool(store: StateStore) -> None:
     result = _dispatch(store, "unknown_tool", {})
     assert result["status"] == "error"
     assert "unknown_tool" in result["message"]
+
+
+# ---------------------------------------------------------------------------
+# Tool registration drift guard
+# ---------------------------------------------------------------------------
+
+
+def test_all_expected_tools_are_handled_by_dispatch() -> None:
+    """Every name in EXPECTED_TOOLS must have a handler in _dispatch.
+
+    Guards against adding a tool to list_tools() but forgetting _dispatch,
+    or vice versa.
+    """
+    store = StateStore(":memory:")
+    store.set("ns", "k", "v", updated_by="a")
+
+    # Minimal valid args that should not return status='error' for each tool
+    valid_calls: dict[str, dict[str, object]] = {
+        "agenthold_get": {"namespace": "ns", "key": "k"},
+        "agenthold_set": {
+            "namespace": "ns",
+            "key": "k2",
+            "value": 1,
+            "updated_by": "a",
+        },
+        "agenthold_list": {"namespace": "ns"},
+        "agenthold_history": {"namespace": "ns", "key": "k"},
+        "agenthold_delete": {"namespace": "ns", "key": "k", "deleted_by": "a"},
+    }
+
+    assert valid_calls.keys() == EXPECTED_TOOLS, (
+        "valid_calls and EXPECTED_TOOLS are out of sync — update this test"
+    )
+
+    for tool_name, args in valid_calls.items():
+        result = _dispatch(store, tool_name, args)
+        assert result.get("status") != "error", (
+            f"Tool '{tool_name}' returned status='error': {result}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# agenthold_delete
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_delete_existing_key(store: StateStore) -> None:
+    store.set("ns", "k", "value", updated_by="a")
+    result = _dispatch(
+        store,
+        "agenthold_delete",
+        {"namespace": "ns", "key": "k", "deleted_by": "cleanup"},
+    )
+    assert result["status"] == "ok"
+    assert result["namespace"] == "ns"
+    assert result["key"] == "k"
+    assert result["deleted_by"] == "cleanup"
+    assert result["deleted_version"] == 1
+
+
+def test_dispatch_delete_missing_key(store: StateStore) -> None:
+    result = _dispatch(
+        store,
+        "agenthold_delete",
+        {"namespace": "ns", "key": "missing", "deleted_by": "cleanup"},
+    )
+    assert result["status"] == "not_found"
+    assert result["namespace"] == "ns"
+    assert result["key"] == "missing"
+
+
+def test_dispatch_delete_conflict(store: StateStore) -> None:
+    store.set("ns", "k", "v1", updated_by="a")
+    store.set("ns", "k", "v2", updated_by="a")
+    result = _dispatch(
+        store,
+        "agenthold_delete",
+        {"namespace": "ns", "key": "k", "deleted_by": "b", "expected_version": 1},
+    )
+    assert result["status"] == "conflict"
+    assert result["expected_version"] == 1
+    assert result["actual_version"] == 2
+    assert "hint" in result
+    assert "message" in result
+
+
+def test_dispatch_delete_tombstone_visible_in_history(store: StateStore) -> None:
+    store.set("ns", "k", "value", updated_by="a")
+    _dispatch(
+        store,
+        "agenthold_delete",
+        {"namespace": "ns", "key": "k", "deleted_by": "cleanup"},
+    )
+    result = _dispatch(store, "agenthold_history", {"namespace": "ns", "key": "k"})
+    assert result["history"][0]["event_type"] == "delete"
+    assert result["history"][0]["updated_by"] == "cleanup"

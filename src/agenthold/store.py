@@ -231,7 +231,13 @@ class StateStore:
     def history(
         self, namespace: str, key: str, limit: int = 10
     ) -> list[StateRecordHistory]:
-        """Return the last N versions of a record, newest first."""
+        """Return the last N history entries for a record, newest first.
+
+        Entries include both writes (event_type='write') and delete tombstones
+        (event_type='delete'). Ordered by insertion id descending rather than
+        version descending — tombstones share the version of the live record
+        they deleted, so id is the only unambiguous ordering.
+        """
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM state_history "
@@ -252,23 +258,47 @@ class StateStore:
             for r in rows
         ]
 
-    def delete(self, namespace: str, key: str) -> bool:
-        """Delete a record. Returns True if it existed, False if not.
+    def delete(
+        self,
+        namespace: str,
+        key: str,
+        deleted_by: str,
+        expected_version: int | None = None,
+    ) -> int | None:
+        """Delete a record. Returns the deleted version, or None if not found.
 
-        A tombstone entry (event_type='delete') is written to state_history so
-        the deletion is visible in the audit trail. The live record is removed.
-        History entries from before the deletion are preserved.
+        If expected_version is provided and does not match the stored version,
+        raises ConflictError. Pass the version from a prior get() to prevent
+        accidentally deleting a record that was updated since your read.
+
+        On deletion, a tombstone entry (event_type='delete') is written to
+        state_history recording deleted_by and the version that was deleted.
+        The live record is removed. Prior history entries are preserved.
         """
         now = self._now()
         with self._transaction() as conn:
             existing = conn.execute(
-                "SELECT version, updated_by FROM state_records "
+                "SELECT version, updated_by, updated_at FROM state_records "
                 "WHERE namespace = ? AND key = ?",
                 (namespace, key),
             ).fetchone()
 
             if existing is None:
-                return False
+                return None
+
+            current_version: int = existing["version"]
+
+            if expected_version is not None and expected_version != current_version:
+                raise ConflictError(
+                    ConflictDetail(
+                        namespace=namespace,
+                        key=key,
+                        expected_version=expected_version,
+                        actual_version=current_version,
+                        updated_by=existing["updated_by"],
+                        updated_at=datetime.fromisoformat(existing["updated_at"]),
+                    )
+                )
 
             # Record the deletion in history before removing the live record
             conn.execute(
@@ -279,8 +309,8 @@ class StateStore:
                     namespace,
                     key,
                     json.dumps(None),
-                    existing["version"],
-                    existing["updated_by"],
+                    current_version,
+                    deleted_by,
                     now,
                 ),
             )
@@ -288,7 +318,7 @@ class StateStore:
                 "DELETE FROM state_records WHERE namespace = ? AND key = ?",
                 (namespace, key),
             )
-        return True
+        return current_version
 
     def close(self) -> None:
         self._conn.close()

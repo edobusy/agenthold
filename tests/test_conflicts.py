@@ -209,7 +209,7 @@ def test_deleted_key_restarts_at_version_1(store: StateStore) -> None:
     store.set("ns", "key", "updated", updated_by="a")
     assert store.get("ns", "key").version == 2
 
-    store.delete("ns", "key")
+    store.delete("ns", "key", deleted_by="operator")
 
     result = store.set("ns", "key", "reborn", updated_by="b")
     assert result.version == 1
@@ -260,7 +260,7 @@ def test_expected_version_zero_fails_for_existing_key(store: StateStore) -> None
 def test_get_after_delete_raises_not_found(store: StateStore) -> None:
     """A deleted key is truly gone from live state."""
     store.set("ns", "key", "value", updated_by="a")
-    store.delete("ns", "key")
+    store.delete("ns", "key", deleted_by="operator")
     with pytest.raises(NotFoundError):
         store.get("ns", "key")
 
@@ -269,7 +269,7 @@ def test_history_preserved_after_delete(store: StateStore) -> None:
     """Deleting a key removes it from live state but history is preserved."""
     store.set("ns", "key", "v1", updated_by="a")
     store.set("ns", "key", "v2", updated_by="b")
-    store.delete("ns", "key")
+    store.delete("ns", "key", deleted_by="operator")
 
     # History now has 3 entries: delete tombstone + 2 prior writes
     history = store.history("ns", "key")

@@ -142,7 +142,10 @@ def main() -> None:
 
     header("ALLOCATION HISTORY  (agenthold audit trail)")
     for h in store.history("campaign", "balance"):
-        print(f"  v{h.version}  ${h.value:>9,.2f}  written by {h.updated_by}")
+        if h.event_type == "delete":
+            print(f"  v{h.version}  [deleted]              by {h.updated_by}")
+        else:
+            print(f"  v{h.version}  ${h.value:>9,.2f}  written by {h.updated_by}")
 
     header("RESULT")
     assert committed <= TOTAL_BUDGET, "BUG: budget overcommitted"

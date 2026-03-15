@@ -96,7 +96,7 @@ except ConflictError as e:
 
 ## Tools
 
-agenthold exposes four tools over the Model Context Protocol.
+agenthold exposes five tools over the Model Context Protocol.
 
 ### `agenthold_get`
 
@@ -225,6 +225,57 @@ Read the version history of a state record, newest first. Useful for debugging c
 ```
 
 Each entry includes an `event_type` field: `"write"` for normal writes, `"delete"` for deletion events. Delete tombstones have `value: null`. An empty history list means no writes have been recorded for this key — the key may not exist. Use `agenthold_get` to check current state.
+
+---
+
+### `agenthold_delete`
+
+Permanently remove a state record. The deletion is written as a tombstone in `agenthold_history` so the full lifecycle of the key remains auditable.
+
+```json
+{
+  "namespace": "order-1234",
+  "key": "status",
+  "deleted_by": "cleanup-agent",
+  "expected_version": 4
+}
+```
+
+**Success:**
+```json
+{
+  "status": "ok",
+  "namespace": "order-1234",
+  "key": "status",
+  "deleted_by": "cleanup-agent",
+  "deleted_version": 4
+}
+```
+
+**Key not found** (not an error — the key is absent either way):
+```json
+{
+  "status": "not_found",
+  "namespace": "order-1234",
+  "key": "status"
+}
+```
+
+**Conflict** (another agent wrote since your last read):
+```json
+{
+  "status": "conflict",
+  "namespace": "order-1234",
+  "key": "status",
+  "expected_version": 4,
+  "actual_version": 5,
+  "actual_updated_by": "fulfillment-agent",
+  "actual_updated_at": "2026-03-15T10:42:01.456+00:00",
+  "hint": "Call agenthold_get to read the current state, merge your changes, and retry with the new version."
+}
+```
+
+Pass `expected_version` (from a prior `agenthold_get`) to prevent accidentally deleting a record that was updated since your read. Omit it to delete unconditionally.
 
 ---
 

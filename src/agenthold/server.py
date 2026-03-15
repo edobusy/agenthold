@@ -154,6 +154,42 @@ def make_server(db_path: str | Path) -> Server:
                     "required": ["namespace", "key"],
                 },
             ),
+            Tool(
+                name="agenthold_delete",
+                description=(
+                    "Delete a state record permanently. "
+                    "The deletion is recorded as a tombstone in agenthold_history "
+                    "(event_type='delete') so the full lifecycle of the key "
+                    "remains auditable. "
+                    "Returns not_found if the key does not exist — this is not "
+                    "an error; the key is absent either way. "
+                    "Pass expected_version (from a prior agenthold_get) to prevent "
+                    "accidentally deleting a record that was updated since your "
+                    "read. Omit expected_version to delete unconditionally."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "namespace": _NS_FIELD,
+                        "key": _KEY_FIELD,
+                        "deleted_by": {
+                            "type": "string",
+                            "description": (
+                                "Your agent identifier, e.g. 'cleanup-agent'"
+                            ),
+                        },
+                        "expected_version": {
+                            "type": "integer",
+                            "description": (
+                                "The version you last read. If the stored version "
+                                "has changed since your read, the delete will be "
+                                "rejected with a conflict response."
+                            ),
+                        },
+                    },
+                    "required": ["namespace", "key", "deleted_by"],
+                },
+            ),
         ]
 
     @server.call_tool()  # type: ignore[untyped-decorator]
@@ -259,6 +295,43 @@ def _dispatch(store: StateStore, name: str, args: dict[str, Any]) -> dict[str, A
                 for r in history_records
             ],
         }
+
+    elif name == "agenthold_delete":
+        try:
+            deleted_version = store.delete(
+                namespace=args["namespace"],
+                key=args["key"],
+                deleted_by=args["deleted_by"],
+                expected_version=args.get("expected_version"),
+            )
+            if deleted_version is None:
+                return {
+                    "status": "not_found",
+                    "namespace": args["namespace"],
+                    "key": args["key"],
+                }
+            return {
+                "status": "ok",
+                "namespace": args["namespace"],
+                "key": args["key"],
+                "deleted_version": deleted_version,
+                "deleted_by": args["deleted_by"],
+            }
+        except ConflictError as e:
+            return {
+                "status": "conflict",
+                "message": str(e),
+                "namespace": e.detail.namespace,
+                "key": e.detail.key,
+                "expected_version": e.detail.expected_version,
+                "actual_version": e.detail.actual_version,
+                "actual_updated_by": e.detail.updated_by,
+                "actual_updated_at": e.detail.updated_at.isoformat(),
+                "hint": (
+                    "Call agenthold_get to read the current state "
+                    "and decide whether to proceed with deletion."
+                ),
+            }
 
     else:
         return {"status": "error", "message": f"Unknown tool: {name}"}

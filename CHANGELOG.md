@@ -7,6 +7,25 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.4] - 2026-03-15
+
+### Added
+- `agenthold_delete` MCP tool: permanently removes a state record and writes a
+  tombstone entry to `state_history` (event_type=`"delete"`) so the full
+  lifecycle of a key remains auditable
+- `StateStore.delete()` accepts an optional `expected_version` for OCC-safe
+  deletes; raises `ConflictError` if the stored version has changed since the
+  caller's last read
+- `deleted_by` parameter on `StateStore.delete()` records agent identity in the
+  tombstone, independent of who last wrote the live record
+- Registration drift guard test: `test_all_expected_tools_are_handled_by_dispatch`
+  asserts every declared tool has a working `_dispatch` handler
+
+### Fixed
+- README now documents all five MCP tools including `agenthold_delete`
+
+---
+
 ## [0.1.3] - 2026-03-15
 
 ### Fixed

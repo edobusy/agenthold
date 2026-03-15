@@ -217,19 +217,20 @@ def test_history_empty_for_missing_key(store: StateStore) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_delete_existing_key_returns_true(store: StateStore) -> None:
+def test_delete_existing_key_returns_deleted_version(store: StateStore) -> None:
     store.set("ns", "key", "value", updated_by="a")
-    assert store.delete("ns", "key") is True
+    result = store.delete("ns", "key", deleted_by="b")
+    assert result == 1
 
 
-def test_delete_missing_key_returns_false(store: StateStore) -> None:
-    assert store.delete("ns", "nonexistent") is False
+def test_delete_missing_key_returns_none(store: StateStore) -> None:
+    assert store.delete("ns", "nonexistent", deleted_by="b") is None
 
 
 def test_delete_removes_from_list(store: StateStore) -> None:
     store.set("ns", "key1", "v1", updated_by="a")
     store.set("ns", "key2", "v2", updated_by="a")
-    store.delete("ns", "key1")
+    store.delete("ns", "key1", deleted_by="b")
     records = store.list_keys("ns")
     keys = [r.key for r in records]
     assert keys == ["key2"]
@@ -237,7 +238,7 @@ def test_delete_removes_from_list(store: StateStore) -> None:
 
 def test_delete_writes_tombstone_to_history(store: StateStore) -> None:
     store.set("ns", "key", "value", updated_by="a")
-    store.delete("ns", "key")
+    store.delete("ns", "key", deleted_by="b")
     history = store.history("ns", "key")
     assert len(history) == 2
     assert history[0].event_type == "delete"
@@ -248,15 +249,15 @@ def test_delete_writes_tombstone_to_history(store: StateStore) -> None:
 def test_delete_tombstone_preserves_prior_history(store: StateStore) -> None:
     store.set("ns", "key", "v1", updated_by="a")
     store.set("ns", "key", "v2", updated_by="b")
-    store.delete("ns", "key")
+    store.delete("ns", "key", deleted_by="c")
     history = store.history("ns", "key", limit=10)
     event_types = [h.event_type for h in history]
     assert event_types == ["delete", "write", "write"]
 
 
 def test_delete_missing_key_writes_no_tombstone(store: StateStore) -> None:
-    result = store.delete("ns", "nonexistent")
-    assert result is False
+    result = store.delete("ns", "nonexistent", deleted_by="b")
+    assert result is None
     history = store.history("ns", "nonexistent")
     assert history == []
 
@@ -265,6 +266,41 @@ def test_history_includes_event_type_field(store: StateStore) -> None:
     store.set("ns", "key", "v1", updated_by="a")
     history = store.history("ns", "key")
     assert history[0].event_type == "write"
+
+
+def test_delete_tombstone_records_deleted_by(store: StateStore) -> None:
+    store.set("ns", "key", "value", updated_by="writer")
+    store.delete("ns", "key", deleted_by="remover")
+    history = store.history("ns", "key")
+    assert history[0].event_type == "delete"
+    assert history[0].updated_by == "remover"
+    assert history[0].updated_by != "writer"
+
+
+def test_delete_with_correct_expected_version_succeeds(store: StateStore) -> None:
+    store.set("ns", "key", "value", updated_by="a")
+    result = store.delete("ns", "key", deleted_by="b", expected_version=1)
+    assert result == 1
+    with pytest.raises(NotFoundError):
+        store.get("ns", "key")
+
+
+def test_delete_with_wrong_expected_version_raises_conflict(store: StateStore) -> None:
+    store.set("ns", "key", "v1", updated_by="a")
+    store.set("ns", "key", "v2", updated_by="a")
+    with pytest.raises(ConflictError) as exc_info:
+        store.delete("ns", "key", deleted_by="b", expected_version=1)
+    assert exc_info.value.detail.expected_version == 1
+    assert exc_info.value.detail.actual_version == 2
+    # Key must still exist — conflict aborted the delete
+    assert store.get("ns", "key").version == 2
+
+
+def test_delete_without_expected_version_is_unconditional(store: StateStore) -> None:
+    store.set("ns", "key", "v1", updated_by="a")
+    store.set("ns", "key", "v2", updated_by="a")
+    result = store.delete("ns", "key", deleted_by="b")
+    assert result == 2  # deleted the version that was live
 
 
 # ---------------------------------------------------------------------------
