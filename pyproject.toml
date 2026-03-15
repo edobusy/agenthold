@@ -17,6 +17,11 @@ dependencies = [
     "pydantic>=2.12.5",
 ]
 
+[project.urls]
+Homepage = "https://github.com/edobusy/agenthold"
+Repository = "https://github.com/edobusy/agenthold"
+Issues = "https://github.com/edobusy/agenthold/issues"
+
 [project.scripts]
 agenthold = "agenthold.server:main"
 
