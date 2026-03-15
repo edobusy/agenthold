@@ -7,6 +7,39 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.3] - 2026-03-15
+
+### Fixed
+- Corrected misleading `isolation_level=None` comment in `StateStore.__init__`
+- `ConflictError` for non-existent keys now reports `updated_by` as
+  `"(key does not exist)"` instead of an empty string
+- Delete operations now write a tombstone entry to `state_history` so deletions
+  are visible in the audit trail
+- `StateRecordHistory` is now a subclass of `StateRecord` to enforce shared structure
+- Version `__init__.py` was out of sync with `pyproject.toml`; both now read `0.1.3`
+
+### Changed
+- Tool descriptions for `agenthold_get`, `agenthold_set`, `agenthold_list`, and
+  `agenthold_history` expanded with edge-case guidance and consistent field
+  descriptions across all tools
+- `agenthold_set` description now documents the `expected_version=0` create-only pattern
+- `agenthold_get` description warns that omitting `expected_version` in a subsequent
+  `agenthold_set` will silently overwrite concurrent changes
+- `agenthold_history` response now includes an `event_type` field (`"write"` or
+  `"delete"`) on each history entry
+- Removed `default=str` fallback from `json.dumps` in the MCP tool handler;
+  serialisation errors now raise explicitly instead of silently corrupting output
+- WAL mode and transaction pattern documented accurately in `StateStore` class docstring
+
+### Tests
+- Added loop guard to `test_conflict_retry_pattern_converges`
+- Added tests for delete tombstone, `ConflictError` `updated_by` sentinel, and
+  `event_type` field on history entries
+- Removed duplicate `store` fixture from `test_server.py`
+- Added JSON serialisation tests for `_dispatch` output
+
+---
+
 ## [0.1.0] - 2026-03-15
 
 ### Added

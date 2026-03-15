@@ -235,6 +235,38 @@ def test_delete_removes_from_list(store: StateStore) -> None:
     assert keys == ["key2"]
 
 
+def test_delete_writes_tombstone_to_history(store: StateStore) -> None:
+    store.set("ns", "key", "value", updated_by="a")
+    store.delete("ns", "key")
+    history = store.history("ns", "key")
+    assert len(history) == 2
+    assert history[0].event_type == "delete"
+    assert history[0].value is None
+    assert history[1].event_type == "write"
+
+
+def test_delete_tombstone_preserves_prior_history(store: StateStore) -> None:
+    store.set("ns", "key", "v1", updated_by="a")
+    store.set("ns", "key", "v2", updated_by="b")
+    store.delete("ns", "key")
+    history = store.history("ns", "key", limit=10)
+    event_types = [h.event_type for h in history]
+    assert event_types == ["delete", "write", "write"]
+
+
+def test_delete_missing_key_writes_no_tombstone(store: StateStore) -> None:
+    result = store.delete("ns", "nonexistent")
+    assert result is False
+    history = store.history("ns", "nonexistent")
+    assert history == []
+
+
+def test_history_includes_event_type_field(store: StateStore) -> None:
+    store.set("ns", "key", "v1", updated_by="a")
+    history = store.history("ns", "key")
+    assert history[0].event_type == "write"
+
+
 # ---------------------------------------------------------------------------
 # value types : explicit round-trip tests
 # ---------------------------------------------------------------------------

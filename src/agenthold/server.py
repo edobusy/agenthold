@@ -34,6 +34,15 @@ from mcp.types import TextContent, Tool
 from agenthold.exceptions import ConflictError, NotFoundError
 from agenthold.store import StateStore
 
+_NS_FIELD: dict[str, str] = {
+    "type": "string",
+    "description": "Workflow or resource identifier, e.g. 'order-1234'",
+}
+_KEY_FIELD: dict[str, str] = {
+    "type": "string",
+    "description": "The state key, e.g. 'status'",
+}
+
 
 def make_server(db_path: str | Path) -> Server:
     store = StateStore(db_path)
@@ -47,22 +56,16 @@ def make_server(db_path: str | Path) -> Server:
                 description=(
                     "Read the current value of a state record. "
                     "Returns the value, version number, and metadata. "
-                    "Use the returned version number in subsequent agenthold_set "
-                    "calls to enable conflict detection."
+                    "Always pass the returned version as expected_version in a "
+                    "subsequent agenthold_set call to enable conflict detection. "
+                    "If you omit expected_version in agenthold_set, your write will "
+                    "silently overwrite any concurrent changes without warning."
                 ),
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "namespace": {
-                            "type": "string",
-                            "description": (
-                                "Workflow or resource identifier, e.g. 'order-1234'"
-                            ),
-                        },
-                        "key": {
-                            "type": "string",
-                            "description": "The state key, e.g. 'status'",
-                        },
+                        "namespace": _NS_FIELD,
+                        "key": _KEY_FIELD,
                     },
                     "required": ["namespace", "key"],
                 },
@@ -72,16 +75,19 @@ def make_server(db_path: str | Path) -> Server:
                 description=(
                     "Write a value to a state record. "
                     "Pass expected_version (from a prior agenthold_get) to enable "
-                    "conflict detection, if another agent has written since your read, "
-                    "you will receive a conflict error with the current state so you "
-                    "can re-read and retry. "
-                    "Omit expected_version to write unconditionally."
+                    "conflict detection — if another agent wrote since your read, "
+                    "you will receive a conflict response with the current state "
+                    "so you can re-read and retry. "
+                    "Pass expected_version=0 to write only if the key does not "
+                    "yet exist (create-only guard). "
+                    "Omit expected_version entirely to write unconditionally, "
+                    "overwriting any concurrent changes without warning."
                 ),
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "namespace": {"type": "string"},
-                        "key": {"type": "string"},
+                        "namespace": _NS_FIELD,
+                        "key": _KEY_FIELD,
                         "value": {
                             "description": "Any JSON-serialisable value",
                         },
@@ -96,7 +102,7 @@ def make_server(db_path: str | Path) -> Server:
                             "description": (
                                 "The version you read before making your changes. "
                                 "If the stored version has changed since your read, "
-                                "the write will be rejected with a conflict error."
+                                "the write will be rejected with a conflict response."
                             ),
                         },
                     },
@@ -105,11 +111,20 @@ def make_server(db_path: str | Path) -> Server:
             ),
             Tool(
                 name="agenthold_list",
-                description="List all current state records in a namespace.",
+                description=(
+                    "List all current state records in a namespace. "
+                    "Returns each key's live value, current version, and "
+                    "last-write metadata. "
+                    "Does not return history — use agenthold_history for past "
+                    "versions. "
+                    "Returns an empty list if the namespace has no records or "
+                    "does not exist; it does not return an error for missing "
+                    "namespaces."
+                ),
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "namespace": {"type": "string"},
+                        "namespace": _NS_FIELD,
                     },
                     "required": ["namespace"],
                 },
@@ -118,13 +133,18 @@ def make_server(db_path: str | Path) -> Server:
                 name="agenthold_history",
                 description=(
                     "Read the version history of a state record, newest first. "
-                    "Useful for debugging coordination issues."
+                    "Useful for debugging coordination issues and auditing writes. "
+                    "Returns an empty list if no writes have been recorded for "
+                    "this key — this does not confirm the key exists. "
+                    "Use agenthold_get to check current state. "
+                    "Each entry includes an event_type field: 'write' for "
+                    "normal writes, 'delete' for deletion events."
                 ),
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "namespace": {"type": "string"},
-                        "key": {"type": "string"},
+                        "namespace": _NS_FIELD,
+                        "key": _KEY_FIELD,
                         "limit": {
                             "type": "integer",
                             "description": "Max versions to return (default 10)",
@@ -141,7 +161,7 @@ def make_server(db_path: str | Path) -> Server:
         name: str, arguments: dict[str, Any]
     ) -> list[TextContent]:
         result = _dispatch(store, name, arguments)
-        text = json.dumps(result, indent=2, default=str)
+        text = json.dumps(result, indent=2)
         return [TextContent(type="text", text=text)]
 
     return server
@@ -234,6 +254,7 @@ def _dispatch(store: StateStore, name: str, args: dict[str, Any]) -> dict[str, A
                     "value": r.value,
                     "updated_by": r.updated_by,
                     "updated_at": r.updated_at.isoformat(),
+                    "event_type": r.event_type,
                 }
                 for r in history_records
             ],

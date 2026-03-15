@@ -102,6 +102,7 @@ def test_conflict_retry_pattern_converges(store: StateStore) -> None:
     version = stale_read.version
     value = stale_read.value
     while not written:
+        assert attempts <= 10, f"Retry loop did not converge after {attempts} attempts"
         attempts += 1
         new_total = value + 50  # add 50 to current value
         try:
@@ -234,6 +235,14 @@ def test_conflict_on_nonexistent_key_with_expected_version(store: StateStore) ->
     assert exc_info.value.detail.expected_version == 1
 
 
+def test_conflict_on_nonexistent_key_updated_by_descriptive(store: StateStore) -> None:
+    """When a key doesn't exist, updated_by must not be an empty string."""
+    with pytest.raises(ConflictError) as exc_info:
+        store.set("ns", "key", "value", updated_by="a", expected_version=1)
+    assert exc_info.value.detail.updated_by == "(key does not exist)"
+    assert exc_info.value.detail.updated_by != ""
+
+
 def test_expected_version_zero_succeeds_for_new_key(store: StateStore) -> None:
     """expected_version=0 is a safe 'create-only' pattern for new keys."""
     result = store.set("ns", "key", "value", updated_by="a", expected_version=0)
@@ -262,11 +271,12 @@ def test_history_preserved_after_delete(store: StateStore) -> None:
     store.set("ns", "key", "v2", updated_by="b")
     store.delete("ns", "key")
 
-    # History should still have both writes
+    # History now has 3 entries: delete tombstone + 2 prior writes
     history = store.history("ns", "key")
-    assert len(history) == 2
-    assert history[0].version == 2
-    assert history[1].version == 1
+    assert len(history) == 3
+    assert history[0].event_type == "delete"
+    assert history[1].version == 2
+    assert history[2].version == 1
 
 
 def test_multiple_namespaces_conflict_independently(store: StateStore) -> None:

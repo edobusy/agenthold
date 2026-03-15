@@ -15,15 +15,14 @@ class StateRecord(BaseModel):
     updated_at: datetime
 
 
-class StateRecordHistory(BaseModel):
-    """A historical snapshot of a record."""
+class StateRecordHistory(StateRecord):
+    """A historical snapshot of a record.
 
-    namespace: str
-    key: str
-    value: Any
-    version: int
-    updated_by: str
-    updated_at: datetime
+    Shares all fields with StateRecord. event_type is 'write' for normal
+    writes and 'delete' for deletion tombstones inserted by delete().
+    """
+
+    event_type: str = "write"
 
 
 class SetResult(BaseModel):

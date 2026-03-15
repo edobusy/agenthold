@@ -1,14 +1,16 @@
 """Tests for the MCP server dispatch layer."""
 
-import pytest
+import json
 
 from agenthold.server import _dispatch, make_server
 from agenthold.store import StateStore
 
-
-@pytest.fixture
-def store() -> StateStore:
-    return StateStore(":memory:")
+EXPECTED_TOOLS = {
+    "agenthold_get",
+    "agenthold_set",
+    "agenthold_list",
+    "agenthold_history",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -20,6 +22,27 @@ def test_make_server_returns_server() -> None:
     server = make_server(":memory:")
     assert server is not None
     assert server.name == "agenthold"
+
+
+def test_dispatch_output_is_json_serialisable() -> None:
+    """_dispatch results must serialise to JSON without default=str fallback."""
+    store = StateStore(":memory:")
+    result = _dispatch(store, "agenthold_get", {"namespace": "ns", "key": "missing"})
+    text = json.dumps(result, indent=2)  # must not raise
+    parsed = json.loads(text)
+    assert parsed["status"] == "not_found"
+
+
+def test_dispatch_history_output_is_json_serialisable(store: StateStore) -> None:
+    """History result including event_type must serialise cleanly."""
+    store.set("ns", "k", "v1", updated_by="a")
+    store.delete("ns", "k")
+    result = _dispatch(store, "agenthold_history", {"namespace": "ns", "key": "k"})
+    text = json.dumps(result, indent=2)  # must not raise
+    parsed = json.loads(text)
+    assert parsed["status"] == "ok"
+    event_types = [entry["event_type"] for entry in parsed["history"]]
+    assert event_types == ["delete", "write"]
 
 
 # ---------------------------------------------------------------------------

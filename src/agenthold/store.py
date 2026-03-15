@@ -3,11 +3,15 @@ Storage layer for agenthold.
 
 Schema:
   state_records : current live state, one row per namespace/key
-  state_history : append-only log of every write
+  state_history : append-only audit log; includes both writes and delete tombstones
 
 Write order (atomic within a transaction):
-  1. INSERT into state_history
+  1. INSERT into state_history (event_type='write')
   2. INSERT OR REPLACE into state_records
+
+Delete order (atomic within a transaction):
+  1. INSERT tombstone into state_history (event_type='delete', value=JSON null)
+  2. DELETE from state_records
 
 Conflict detection uses optimistic concurrency control (OCC):
   The caller passes expected_version. If the stored version differs,
@@ -50,7 +54,8 @@ CREATE TABLE IF NOT EXISTS state_history (
     value       TEXT NOT NULL,
     version     INTEGER NOT NULL,
     updated_by  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
+    updated_at  TEXT NOT NULL,
+    event_type  TEXT NOT NULL DEFAULT 'write'
 );
 
 CREATE INDEX IF NOT EXISTS idx_history_ns_key
@@ -59,18 +64,42 @@ CREATE INDEX IF NOT EXISTS idx_history_ns_key
 
 
 class StateStore:
+    """SQLite-backed state store with optimistic concurrency control.
+
+    Thread safety:
+      All public methods acquire self._lock. Writes use _transaction() which
+      issues explicit BEGIN/COMMIT. Reads acquire the lock but run as autocommit
+      statements — single-statement SQLite reads are atomic and do not need an
+      explicit transaction. Any future method with multiple read statements must
+      use _transaction().
+
+    WAL mode:
+      WAL is set for forward-compatibility. The current single-lock model
+      serialises all reads and writes, so concurrent-reader performance is not
+      realised yet. Splitting into separate read and write locks is a future
+      improvement.
+    """
+
     def __init__(self, db_path: str | Path = ":memory:") -> None:
         self.db_path = str(db_path)
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(
             self.db_path,
             check_same_thread=False,
-            isolation_level=None,  # autocommit off, we manage transactions
+            isolation_level=None,  # autocommit on; BEGIN/COMMIT managed explicitly
         )
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
+        # Migration: add event_type to databases that predate this column.
+        try:
+            self._conn.execute(
+                "ALTER TABLE state_history "
+                "ADD COLUMN event_type TEXT NOT NULL DEFAULT 'write'"
+            )
+        except sqlite3.OperationalError:
+            pass  # Column already exists — db already migrated or just created
 
     @contextmanager
     def _transaction(self) -> Generator[sqlite3.Connection, None, None]:
@@ -141,7 +170,11 @@ class StateStore:
                         key=key,
                         expected_version=expected_version,
                         actual_version=current_version,
-                        updated_by=existing["updated_by"] if existing else "",
+                        updated_by=(
+                            existing["updated_by"]
+                            if existing
+                            else "(key does not exist)"
+                        ),
                         updated_at=datetime.fromisoformat(existing["updated_at"])
                         if existing
                         else datetime.now(UTC),
@@ -203,7 +236,7 @@ class StateStore:
             rows = self._conn.execute(
                 "SELECT * FROM state_history "
                 "WHERE namespace = ? AND key = ? "
-                "ORDER BY version DESC LIMIT ?",
+                "ORDER BY id DESC LIMIT ?",
                 (namespace, key, limit),
             ).fetchall()
         return [
@@ -214,18 +247,48 @@ class StateStore:
                 version=r["version"],
                 updated_by=r["updated_by"],
                 updated_at=datetime.fromisoformat(r["updated_at"]),
+                event_type=r["event_type"],
             )
             for r in rows
         ]
 
     def delete(self, namespace: str, key: str) -> bool:
-        """Delete a record. Returns True if it existed, False if not."""
+        """Delete a record. Returns True if it existed, False if not.
+
+        A tombstone entry (event_type='delete') is written to state_history so
+        the deletion is visible in the audit trail. The live record is removed.
+        History entries from before the deletion are preserved.
+        """
+        now = self._now()
         with self._transaction() as conn:
-            result = conn.execute(
+            existing = conn.execute(
+                "SELECT version, updated_by FROM state_records "
+                "WHERE namespace = ? AND key = ?",
+                (namespace, key),
+            ).fetchone()
+
+            if existing is None:
+                return False
+
+            # Record the deletion in history before removing the live record
+            conn.execute(
+                "INSERT INTO state_history "
+                "(namespace, key, value, version, updated_by, updated_at, event_type) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'delete')",
+                (
+                    namespace,
+                    key,
+                    json.dumps(None),
+                    existing["version"],
+                    existing["updated_by"],
+                    now,
+                ),
+            )
+            conn.execute(
                 "DELETE FROM state_records WHERE namespace = ? AND key = ?",
                 (namespace, key),
             )
-        return result.rowcount > 0
+        return True
 
     def close(self) -> None:
         self._conn.close()
