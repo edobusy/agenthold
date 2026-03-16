@@ -36,7 +36,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
-from agenthold.exceptions import ConflictError, NotFoundError
+from agenthold.exceptions import BusyError, ConflictError, NotFoundError
 from agenthold.store import StateStore
 
 _NS_FIELD: dict[str, str] = {
@@ -278,8 +278,8 @@ def make_server(db_path: str | Path) -> Server:
                     "For large namespaces, this response can be very large. "
                     "If the namespace is unfamiliar, call agenthold_list first to "
                     "preview how many keys exist before calling agenthold_export. "
-                    "This call holds the server lock for the full duration of all "
-                    "reads; do not call it in tight loops or polling patterns. "
+                    "This call holds a read transaction for the full duration "
+                    "of all reads; do not call it in tight loops or polling patterns. "
                     "Returns record_count=0 and an empty records list if the "
                     "namespace has no live records — this is not an error. "
                     "If you expected records but got record_count=0, verify the "
@@ -362,6 +362,20 @@ def make_server(db_path: str | Path) -> Server:
 
 def _dispatch(store: StateStore, name: str, args: dict[str, Any]) -> dict[str, Any]:
     """Synchronous dispatch — the store is internally thread-safe."""
+    try:
+        return _dispatch_tool(store, name, args)
+    except BusyError:
+        return {
+            "status": "busy",
+            "message": ("The database is temporarily locked by another writer."),
+            "hint": "Retry the operation after a short delay.",
+        }
+
+
+def _dispatch_tool(
+    store: StateStore, name: str, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Route a tool call to the appropriate store method."""
     if name == "agenthold_get":
         try:
             record = store.get(args["namespace"], args["key"])

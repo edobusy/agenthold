@@ -28,3 +28,18 @@ class NotFoundError(AgentholdError):
         self.namespace = namespace
         self.key = key
         super().__init__(f"Key '{key}' not found in namespace '{namespace}'")
+
+
+class BusyError(AgentholdError):
+    """Raised when the database is locked by another writer.
+
+    This happens when BEGIN IMMEDIATE cannot acquire the write lock
+    within the busy_timeout window (another process is holding it).
+    The caller should retry after a short delay.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "The database is temporarily locked by another writer. "
+            "Retry the operation after a short delay."
+        )

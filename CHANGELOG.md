@@ -7,6 +7,32 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.8] - 2026-03-16
+
+### Fixed
+- **Critical**: write transactions now use `BEGIN IMMEDIATE` instead of
+  `BEGIN DEFERRED`, fixing a multi-process race where two agenthold processes
+  sharing the same database file could both read the same version and both
+  write version+1, bypassing OCC conflict detection entirely
+- `close()` now acquires `self._lock` before closing the SQLite connection,
+  preventing corruption if another thread is mid-operation
+
+### Added
+- `PRAGMA busy_timeout=5000`: a second writer now waits up to 5 seconds for
+  the write lock instead of failing immediately with a raw
+  `sqlite3.OperationalError`
+- `BusyError` exception: raised when the busy timeout expires; the MCP server
+  returns a structured `{"status": "busy", "hint": "..."}` response so agents
+  can retry
+- `_read_transaction()` context manager for consistent multi-statement reads
+  using `BEGIN DEFERRED`; `export_namespace` now uses this instead of
+  `_transaction()`, so exports no longer block writers in WAL mode
+- `tests/test_concurrency.py`: 7 new tests covering multi-connection OCC
+  correctness, concurrent export + write, busy timeout pragma, BusyError
+  propagation, and thread-safe close
+
+---
+
 ## [0.1.7] - 2026-03-16
 
 ### Added

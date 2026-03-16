@@ -37,7 +37,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-from agenthold.exceptions import ConflictError, NotFoundError
+from agenthold.exceptions import BusyError, ConflictError, NotFoundError
 from agenthold.models import (
     ConflictDetail,
     SetResult,
@@ -77,16 +77,22 @@ class StateStore:
 
     Thread safety:
       All public methods acquire self._lock. Writes use _transaction() which
-      issues explicit BEGIN/COMMIT. Reads acquire the lock but run as autocommit
-      statements — single-statement SQLite reads are atomic and do not need an
-      explicit transaction. Any future method with multiple read statements must
-      use _transaction().
+      issues explicit BEGIN IMMEDIATE / COMMIT. Reads acquire the lock but run
+      as autocommit statements — single-statement SQLite reads are atomic and
+      do not need an explicit transaction. Multi-statement reads use
+      _read_transaction() which issues BEGIN DEFERRED / COMMIT.
+
+    Multi-process safety:
+      _transaction() uses BEGIN IMMEDIATE so that the SQLite write lock is
+      acquired before any reads. This prevents the stale-snapshot race where
+      two processes both read the same version and both write version + 1.
+      busy_timeout is set so a second writer waits rather than failing
+      immediately when the write lock is held by another process.
 
     WAL mode:
-      WAL is set for forward-compatibility. The current single-lock model
-      serialises all reads and writes, so concurrent-reader performance is not
-      realised yet. Splitting into separate read and write locks is a future
-      improvement.
+      WAL is enabled to allow concurrent readers alongside one writer across
+      processes. _read_transaction() (BEGIN DEFERRED) acquires only a shared
+      lock and does not block writers in other processes.
     """
 
     def __init__(self, db_path: str | Path = ":memory:") -> None:
@@ -99,6 +105,7 @@ class StateStore:
         )
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
         # Migration: add event_type to databases that predate this column.
@@ -112,8 +119,40 @@ class StateStore:
 
     @contextmanager
     def _transaction(self) -> Generator[sqlite3.Connection, None, None]:
+        """Write transaction with immediate lock acquisition.
+
+        BEGIN IMMEDIATE acquires the SQLite reserved (write) lock before
+        any reads execute. This prevents the stale-snapshot race across
+        processes: a second writer blocks until the first commits, then
+        reads the fresh state and detects the OCC conflict properly.
+
+        If the write lock cannot be acquired within busy_timeout (5 s),
+        sqlite3.OperationalError is caught and re-raised as BusyError.
+        """
         with self._lock:
-            self._conn.execute("BEGIN")
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e):
+                    raise BusyError() from e
+                raise
+            try:
+                yield self._conn
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    @contextmanager
+    def _read_transaction(self) -> Generator[sqlite3.Connection, None, None]:
+        """Consistent read snapshot without blocking writers.
+
+        Uses BEGIN DEFERRED — the snapshot is established at the first
+        SELECT and holds only a shared lock for the duration. Writers
+        using BEGIN IMMEDIATE can proceed concurrently in WAL mode.
+        """
+        with self._lock:
+            self._conn.execute("BEGIN DEFERRED")
             try:
                 yield self._conn
                 self._conn.execute("COMMIT")
@@ -408,7 +447,7 @@ class StateStore:
 
         Returns (exported_at, []) if the namespace has no live records.
         """
-        with self._transaction() as conn:
+        with self._read_transaction() as conn:
             exported_at = self._now()
 
             live_rows = conn.execute(
@@ -452,4 +491,5 @@ class StateStore:
         return exported_at, entries
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
