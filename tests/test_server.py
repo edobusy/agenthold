@@ -12,6 +12,7 @@ EXPECTED_TOOLS = {
     "agenthold_history",
     "agenthold_delete",
     "agenthold_clear_namespace",
+    "agenthold_export",
 }
 
 ASYNC_TOOLS = {"agenthold_watch"}
@@ -232,6 +233,7 @@ def test_all_expected_tools_are_handled_by_dispatch() -> None:
         "agenthold_history": {"namespace": "ns", "key": "k"},
         "agenthold_delete": {"namespace": "ns", "key": "k", "deleted_by": "a"},
         "agenthold_clear_namespace": {"namespace": "ns", "deleted_by": "a"},
+        "agenthold_export": {"namespace": "ns"},
     }
 
     assert valid_calls.keys() == EXPECTED_TOOLS, (
@@ -369,3 +371,54 @@ def test_dispatch_clear_namespace_output_is_json_serialisable(
     text = json.dumps(result, indent=2)  # must not raise
     parsed = json.loads(text)
     assert parsed["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# agenthold_export
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_export_namespace_happy_path(store: StateStore) -> None:
+    from datetime import datetime
+
+    store.set("ns", "key-a", "v1", updated_by="a")
+    store.set("ns", "key-a", "v2", updated_by="a")
+    store.set("ns", "key-b", "v1", updated_by="b")
+    result = _dispatch(store, "agenthold_export", {"namespace": "ns"})
+    assert result["status"] == "ok"
+    assert result["namespace"] == "ns"
+    datetime.fromisoformat(result["exported_at"])  # must be a valid ISO timestamp
+    assert result["record_count"] == 2
+    assert result["history_count"] == 3
+    records = result["records"]
+    assert [r["key"] for r in records] == ["key-a", "key-b"]
+    for r in records:
+        assert len(r["history"]) > 0
+
+
+def test_dispatch_export_namespace_empty(store: StateStore) -> None:
+    from datetime import datetime
+
+    result = _dispatch(store, "agenthold_export", {"namespace": "empty"})
+    assert result["status"] == "ok"
+    assert result["namespace"] == "empty"
+    datetime.fromisoformat(result["exported_at"])  # present and valid even when empty
+    assert result["record_count"] == 0
+    assert result["history_count"] == 0
+    assert result["records"] == []
+
+
+def test_dispatch_export_namespace_output_is_json_serialisable(
+    store: StateStore,
+) -> None:
+    store.set("ns", "k", "original", updated_by="a")
+    store.delete("ns", "k", deleted_by="b")
+    store.set("ns", "k", "recreated", updated_by="c")
+    result = _dispatch(store, "agenthold_export", {"namespace": "ns"})
+    text = json.dumps(result, indent=2)  # must not raise
+    parsed = json.loads(text)
+    assert parsed["status"] == "ok"
+    history = parsed["records"][0]["history"]
+    tombstones = [e for e in history if e["event_type"] == "delete"]
+    assert len(tombstones) == 1
+    assert tombstones[0]["value"] is None

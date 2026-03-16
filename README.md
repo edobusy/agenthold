@@ -96,7 +96,7 @@ except ConflictError as e:
 
 ## Tools
 
-agenthold exposes seven tools over the Model Context Protocol.
+agenthold exposes eight tools over the Model Context Protocol.
 
 ### `agenthold_get`
 
@@ -276,6 +276,65 @@ Permanently remove a state record. The deletion is written as a tombstone in `ag
 ```
 
 Pass `expected_version` (from a prior `agenthold_get`) to prevent accidentally deleting a record that was updated since your read. Omit it to delete unconditionally.
+
+---
+
+### `agenthold_export`
+
+Export all live records and their complete version history for a namespace as a single JSON snapshot. Intended for debugging coordination issues and building audit trails.
+
+```json
+{ "namespace": "order-1234" }
+```
+
+```json
+{
+  "status": "ok",
+  "namespace": "order-1234",
+  "exported_at": "2026-03-16T10:00:00.123456+00:00",
+  "record_count": 2,
+  "history_count": 5,
+  "records": [
+    {
+      "key": "status",
+      "value": "shipped",
+      "version": 3,
+      "updated_by": "logistics-agent",
+      "updated_at": "2026-03-16T09:59:00+00:00",
+      "history": [
+        {"version": 3, "value": "shipped",    "event_type": "write", "updated_by": "logistics-agent",   "updated_at": "..."},
+        {"version": 2, "value": "processing", "event_type": "write", "updated_by": "fulfillment-agent", "updated_at": "..."},
+        {"version": 1, "value": "received",   "event_type": "write", "updated_by": "intake-agent",      "updated_at": "..."}
+      ]
+    },
+    {
+      "key": "total",
+      "value": 99.99,
+      "version": 2,
+      "updated_by": "pricing-agent",
+      "updated_at": "2026-03-16T09:58:00+00:00",
+      "history": [
+        {"version": 2, "value": 99.99, "event_type": "write", "updated_by": "pricing-agent", "updated_at": "..."},
+        {"version": 1, "value": 89.99, "event_type": "write", "updated_by": "intake-agent",  "updated_at": "..."}
+      ]
+    }
+  ]
+}
+```
+
+Records are sorted alphabetically by key. History entries are ordered newest first. `history_count` is the total across all keys and includes delete tombstones (which have `value: null`). Only live (non-deleted) keys are included; use `agenthold_history` to inspect deleted keys.
+
+**Empty or nonexistent namespace** (not an error):
+```json
+{
+  "status": "ok",
+  "namespace": "order-1234",
+  "exported_at": "2026-03-16T10:00:00.123456+00:00",
+  "record_count": 0,
+  "history_count": 0,
+  "records": []
+}
+```
 
 ---
 

@@ -7,6 +7,18 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.7] - 2026-03-16
+
+### Added
+- `agenthold_export` MCP tool: exports all live records and their complete version
+  history for a namespace as a single JSON snapshot, grouped per key; intended for
+  debugging coordination issues and building audit trails
+- `StateStore.export_namespace()` returns a consistent snapshot via a single
+  `_transaction()` call; queries `state_history` without a LIMIT clause so complete
+  history is always returned; includes tombstones on re-created keys
+
+---
+
 ## [0.1.6] - 2026-03-16
 
 ### Added

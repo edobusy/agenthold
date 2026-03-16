@@ -1,14 +1,15 @@
 """
 Agenthold MCP server.
 
-Exposes seven tools over the Model Context Protocol:
+Exposes eight tools over the Model Context Protocol:
   agenthold_get             : read a state record
   agenthold_set             : write a state record (with optional conflict detection)
   agenthold_list            : list all keys in a namespace
   agenthold_history         : read the version history of a key
   agenthold_delete          : permanently delete a state record
-  agenthold_watch           : wait for a key's version to change
   agenthold_clear_namespace : delete all records in a namespace
+  agenthold_export          : export all records and full history for a namespace
+  agenthold_watch           : wait for a key's version to change
 
 Usage:
   agenthold --db ./state.db
@@ -251,6 +252,49 @@ def make_server(db_path: str | Path) -> Server:
                 },
             ),
             Tool(
+                name="agenthold_export",
+                description=(
+                    "Export all live records and their complete version history "
+                    "for a namespace as a single JSON snapshot. "
+                    "Intended for debugging coordination issues and building "
+                    "audit trails. "
+                    "Records are sorted alphabetically by key. "
+                    "Each record entry contains the current value and the full "
+                    "history of that key, newest event first. "
+                    "History includes all event types — 'write' for normal writes "
+                    "and 'delete' for tombstones. Delete tombstones have value null. "
+                    "record_count is the number of live keys in the namespace. "
+                    "history_count is the total number of history entries across all "
+                    "keys, including tombstones — it is not a count of writes only. "
+                    "Check history_count after receiving the response to understand "
+                    "total history volume without iterating all records. "
+                    "If a key was deleted and recreated, its history contains "
+                    "tombstones from the prior lifecycle alongside the new writes. "
+                    "Only live (non-deleted) keys are included. "
+                    "To inspect the history of a deleted key, use agenthold_history "
+                    "— you must already know the key name; there is no tool to list "
+                    "deleted keys. "
+                    "exported_at is the ISO timestamp of when the snapshot was taken. "
+                    "For large namespaces, this response can be very large. "
+                    "If the namespace is unfamiliar, call agenthold_list first to "
+                    "preview how many keys exist before calling agenthold_export. "
+                    "This call holds the server lock for the full duration of all "
+                    "reads; do not call it in tight loops or polling patterns. "
+                    "Returns record_count=0 and an empty records list if the "
+                    "namespace has no live records — this is not an error. "
+                    "If you expected records but got record_count=0, verify the "
+                    "namespace name. If records were recently deleted, use "
+                    "agenthold_history on individual keys to see their tombstones."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "namespace": _NS_FIELD,
+                    },
+                    "required": ["namespace"],
+                },
+            ),
+            Tool(
                 name="agenthold_watch",
                 description=(
                     "Wait for a key's version to change, then return the new value. "
@@ -472,6 +516,38 @@ def _dispatch(store: StateStore, name: str, args: dict[str, Any]) -> dict[str, A
             "deleted_count": len(deleted_keys),
             "deleted_keys": deleted_keys,
             "deleted_by": args["deleted_by"],
+        }
+
+    elif name == "agenthold_export":
+        exported_at, entries = store.export_namespace(
+            namespace=args["namespace"],
+        )
+        return {
+            "status": "ok",
+            "namespace": args["namespace"],
+            "exported_at": exported_at,
+            "record_count": len(entries),
+            "history_count": sum(len(hist) for _, hist in entries),
+            "records": [
+                {
+                    "key": record.key,
+                    "value": record.value,
+                    "version": record.version,
+                    "updated_by": record.updated_by,
+                    "updated_at": record.updated_at.isoformat(),
+                    "history": [
+                        {
+                            "version": entry.version,
+                            "value": entry.value,
+                            "event_type": entry.event_type,
+                            "updated_by": entry.updated_by,
+                            "updated_at": entry.updated_at.isoformat(),
+                        }
+                        for entry in history
+                    ],
+                }
+                for record, history in entries
+            ],
         }
 
     else:

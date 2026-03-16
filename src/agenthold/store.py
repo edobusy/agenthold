@@ -18,6 +18,10 @@ Clear order (atomic within a single transaction, all keys in a namespace):
   2. executemany INSERT tombstones into state_history for each key
   3. DELETE all rows from state_records WHERE namespace = ?
 
+Export order (read-only, consistent snapshot, all keys in a namespace):
+  1. SELECT all live keys for the namespace (ordered by key)
+  2. For each live key: SELECT all history entries (ordered by id DESC, no limit)
+
 Conflict detection uses optimistic concurrency control (OCC):
   The caller passes expected_version. If the stored version differs,
   we raise ConflictError without writing. The caller re-reads and retries.
@@ -379,6 +383,73 @@ class StateStore:
             )
 
         return [row["key"] for row in rows]
+
+    def export_namespace(
+        self,
+        namespace: str,
+    ) -> tuple[str, list[tuple[StateRecord, list[StateRecordHistory]]]]:
+        """Return all live records and their complete history for a namespace.
+
+        Records are sorted alphabetically by key. History entries per key are
+        ordered newest first (by insertion id descending). All reads occur
+        within a single transaction for a consistent snapshot.
+
+        Issues N+1 queries (one SELECT for live records, one per key for
+        history). Acceptable for the debugging/audit use case; not suitable
+        for hot paths. This is the only store method that queries state_history
+        without a LIMIT clause — "complete history" means all entries.
+
+        Returns (exported_at, entries) where:
+          exported_at : ISO timestamp string of when the snapshot was taken.
+                        Uses the same clock source as write methods via
+                        self._now(), but is not persisted to the database.
+          entries     : list of (StateRecord, list[StateRecordHistory]) pairs,
+                        one per live key, sorted alphabetically
+
+        Returns (exported_at, []) if the namespace has no live records.
+        """
+        with self._transaction() as conn:
+            exported_at = self._now()
+
+            live_rows = conn.execute(
+                "SELECT * FROM state_records WHERE namespace = ? ORDER BY key",
+                (namespace,),
+            ).fetchall()
+
+            if not live_rows:
+                return exported_at, []
+
+            entries: list[tuple[StateRecord, list[StateRecordHistory]]] = []
+            for row in live_rows:
+                record = StateRecord(
+                    namespace=row["namespace"],
+                    key=row["key"],
+                    value=json.loads(row["value"]),
+                    version=row["version"],
+                    updated_by=row["updated_by"],
+                    updated_at=datetime.fromisoformat(row["updated_at"]),
+                )
+                history_rows = conn.execute(
+                    "SELECT * FROM state_history "
+                    "WHERE namespace = ? AND key = ? "
+                    "ORDER BY id DESC",
+                    (namespace, row["key"]),
+                ).fetchall()
+                history = [
+                    StateRecordHistory(
+                        namespace=h["namespace"],
+                        key=h["key"],
+                        value=json.loads(h["value"]),
+                        version=h["version"],
+                        updated_by=h["updated_by"],
+                        updated_at=datetime.fromisoformat(h["updated_at"]),
+                        event_type=h["event_type"],
+                    )
+                    for h in history_rows
+                ]
+                entries.append((record, history))
+
+        return exported_at, entries
 
     def close(self) -> None:
         self._conn.close()

@@ -410,3 +410,114 @@ def test_clear_namespace_is_idempotent(store: StateStore) -> None:
     store.clear_namespace("ns", deleted_by="cleanup")
     result = store.clear_namespace("ns", deleted_by="cleanup")
     assert result == []
+
+
+# ---------------------------------------------------------------------------
+# export_namespace
+# ---------------------------------------------------------------------------
+
+
+def test_export_namespace_returns_records_and_history(store: StateStore) -> None:
+    store.set("ns", "alpha", "v1", updated_by="a")
+    store.set("ns", "alpha", "v2", updated_by="a")
+    store.set("ns", "beta", "v1", updated_by="b")
+    store.set("ns", "beta", "v2", updated_by="b")
+    _, entries = store.export_namespace("ns")
+    assert len(entries) == 2
+    for record, history in entries:
+        assert isinstance(record, StateRecord)
+        assert record.namespace == "ns"
+        assert len(history) == 2
+        assert history[0].version > history[1].version  # newest first
+
+
+def test_export_namespace_empty_namespace(store: StateStore) -> None:
+    exported_at, entries = store.export_namespace("nonexistent")
+    assert isinstance(exported_at, str)
+    assert len(exported_at) > 0
+    assert entries == []
+
+
+def test_export_namespace_records_sorted_alphabetically(store: StateStore) -> None:
+    store.set("ns", "z", "v1", updated_by="a")
+    store.set("ns", "a", "v1", updated_by="a")
+    store.set("ns", "m", "v1", updated_by="a")
+    _, entries = store.export_namespace("ns")
+    keys = [record.key for record, _ in entries]
+    assert keys == ["a", "m", "z"]
+
+
+def test_export_namespace_history_newest_first(store: StateStore) -> None:
+    store.set("ns", "k", "v1", updated_by="a")
+    store.set("ns", "k", "v2", updated_by="a")
+    store.set("ns", "k", "v3", updated_by="a")
+    _, entries = store.export_namespace("ns")
+    assert len(entries) == 1
+    _, history = entries[0]
+    assert [h.version for h in history] == [3, 2, 1]
+
+
+def test_export_namespace_history_has_no_limit(store: StateStore) -> None:
+    for i in range(15):
+        store.set("ns", "k", f"v{i}", updated_by="a")
+    _, entries = store.export_namespace("ns")
+    assert len(entries) == 1
+    _, history = entries[0]
+    assert len(history) == 15
+
+
+def test_export_namespace_includes_tombstones_in_history(store: StateStore) -> None:
+    store.set("ns", "k", "original", updated_by="a")
+    store.delete("ns", "k", deleted_by="b")
+    store.set("ns", "k", "recreated", updated_by="c")
+    _, entries = store.export_namespace("ns")
+    assert len(entries) == 1
+    _, history = entries[0]
+    assert len(history) == 3
+    assert history[0].event_type == "write"  # newest: re-create
+    assert history[1].event_type == "delete"  # tombstone
+    assert history[1].value is None
+    assert history[2].event_type == "write"  # original write
+
+
+def test_export_namespace_only_live_keys(store: StateStore) -> None:
+    store.set("ns", "live", "v1", updated_by="a")
+    store.set("ns", "gone", "v1", updated_by="a")
+    store.delete("ns", "gone", deleted_by="b")
+    _, entries = store.export_namespace("ns")
+    keys = [record.key for record, _ in entries]
+    assert keys == ["live"]
+    assert "gone" not in keys
+
+
+def test_export_namespace_does_not_include_other_namespaces(
+    store: StateStore,
+) -> None:
+    store.set("ns-a", "k1", "v1", updated_by="a")
+    store.set("ns-a", "k2", "v1", updated_by="a")
+    store.set("ns-b", "other", "v1", updated_by="a")
+    _, entries = store.export_namespace("ns-a")
+    assert len(entries) == 2
+    for record, _ in entries:
+        assert record.namespace == "ns-a"
+        assert record.key != "other"
+
+
+def test_export_namespace_exported_at_is_iso_string(store: StateStore) -> None:
+    store.set("ns", "k", "v", updated_by="a")
+    exported_at, _ = store.export_namespace("ns")
+    parsed = datetime.fromisoformat(exported_at)  # must not raise
+    assert parsed is not None
+
+
+def test_export_namespace_total_history_entries_returned(
+    store: StateStore,
+) -> None:
+    store.set("ns", "key-a", "v1", updated_by="a")
+    store.set("ns", "key-a", "v2", updated_by="a")
+    store.set("ns", "key-a", "v3", updated_by="a")
+    store.set("ns", "key-b", "v1", updated_by="b")
+    store.set("ns", "key-b", "v2", updated_by="b")
+    _, entries = store.export_namespace("ns")
+    total = sum(len(history) for _, history in entries)
+    assert total == 5
