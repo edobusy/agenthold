@@ -1,13 +1,14 @@
 """
 Agenthold MCP server.
 
-Exposes six tools over the Model Context Protocol:
-  agenthold_get : read a state record
-  agenthold_set : write a state record (with optional conflict detection)
-  agenthold_list : list all keys in a namespace
-  agenthold_history : read the version history of a key
-  agenthold_delete : permanently delete a state record
-  agenthold_watch : wait for a key's version to change
+Exposes seven tools over the Model Context Protocol:
+  agenthold_get             : read a state record
+  agenthold_set             : write a state record (with optional conflict detection)
+  agenthold_list            : list all keys in a namespace
+  agenthold_history         : read the version history of a key
+  agenthold_delete          : permanently delete a state record
+  agenthold_watch           : wait for a key's version to change
+  agenthold_clear_namespace : delete all records in a namespace
 
 Usage:
   agenthold --db ./state.db
@@ -204,6 +205,49 @@ def make_server(db_path: str | Path) -> Server:
                         },
                     },
                     "required": ["namespace", "key", "deleted_by"],
+                },
+            ),
+            Tool(
+                name="agenthold_clear_namespace",
+                description=(
+                    "Delete all state records in a namespace in a single "
+                    "atomic operation. "
+                    "Intended for cleanup at the end of a workflow. "
+                    "A deletion tombstone is written to agenthold_history for "
+                    "every key removed, so the full lifecycle remains auditable. "
+                    "This operation has no conflict guard — it deletes "
+                    "unconditionally. "
+                    "If you need to inspect the namespace before clearing, call "
+                    "agenthold_list first — but note that agenthold_list "
+                    "followed by agenthold_clear_namespace is not atomic: "
+                    "concurrent writes between the two calls may change "
+                    "what gets deleted. "
+                    "If other agents are writing to this namespace "
+                    "concurrently, keys may reappear immediately after "
+                    "this call returns. "
+                    "If deleted_keys contains unexpected entries, call "
+                    "agenthold_history on those keys to investigate "
+                    "what was written and by whom. "
+                    "Agents calling agenthold_watch on keys in this namespace "
+                    "will not be immediately notified of deletion — "
+                    "their watches will time out. "
+                    "Returns the list of deleted keys (sorted alphabetically) "
+                    "and a count. "
+                    "Returns deleted_count=0 with an empty list if the namespace "
+                    "has no records or does not exist — this is not an error."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "namespace": _NS_FIELD,
+                        "deleted_by": {
+                            "type": "string",
+                            "description": (
+                                "Your agent identifier, e.g. 'cleanup-agent'"
+                            ),
+                        },
+                    },
+                    "required": ["namespace", "deleted_by"],
                 },
             ),
             Tool(
@@ -416,6 +460,19 @@ def _dispatch(store: StateStore, name: str, args: dict[str, Any]) -> dict[str, A
                     "with expected_version=actual_version."
                 ),
             }
+
+    elif name == "agenthold_clear_namespace":
+        deleted_keys = store.clear_namespace(
+            namespace=args["namespace"],
+            deleted_by=args["deleted_by"],
+        )
+        return {
+            "status": "ok",
+            "namespace": args["namespace"],
+            "deleted_count": len(deleted_keys),
+            "deleted_keys": deleted_keys,
+            "deleted_by": args["deleted_by"],
+        }
 
     else:
         return {"status": "error", "message": f"Unknown tool: {name}"}

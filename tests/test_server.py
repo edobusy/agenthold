@@ -11,6 +11,7 @@ EXPECTED_TOOLS = {
     "agenthold_list",
     "agenthold_history",
     "agenthold_delete",
+    "agenthold_clear_namespace",
 }
 
 ASYNC_TOOLS = {"agenthold_watch"}
@@ -230,6 +231,7 @@ def test_all_expected_tools_are_handled_by_dispatch() -> None:
         "agenthold_list": {"namespace": "ns"},
         "agenthold_history": {"namespace": "ns", "key": "k"},
         "agenthold_delete": {"namespace": "ns", "key": "k", "deleted_by": "a"},
+        "agenthold_clear_namespace": {"namespace": "ns", "deleted_by": "a"},
     }
 
     assert valid_calls.keys() == EXPECTED_TOOLS, (
@@ -320,3 +322,50 @@ def test_async_tools_are_not_handled_by_dispatch() -> None:
 async def test_watch_is_importable() -> None:
     """_watch must be importable as a module-level function."""
     assert callable(_watch)
+
+
+# ---------------------------------------------------------------------------
+# agenthold_clear_namespace
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_clear_namespace_with_records(store: StateStore) -> None:
+    store.set("ns", "k1", "v1", updated_by="a")
+    store.set("ns", "k2", "v2", updated_by="a")
+    result = _dispatch(
+        store,
+        "agenthold_clear_namespace",
+        {"namespace": "ns", "deleted_by": "cleanup"},
+    )
+    assert result["status"] == "ok"
+    assert result["namespace"] == "ns"
+    assert result["deleted_count"] == 2
+    assert result["deleted_keys"] == ["k1", "k2"]
+    assert result["deleted_by"] == "cleanup"
+
+
+def test_dispatch_clear_namespace_empty(store: StateStore) -> None:
+    result = _dispatch(
+        store,
+        "agenthold_clear_namespace",
+        {"namespace": "empty", "deleted_by": "cleanup"},
+    )
+    assert result["status"] == "ok"
+    assert result["namespace"] == "empty"
+    assert result["deleted_count"] == 0
+    assert result["deleted_keys"] == []
+    assert result["deleted_by"] == "cleanup"
+
+
+def test_dispatch_clear_namespace_output_is_json_serialisable(
+    store: StateStore,
+) -> None:
+    store.set("ns", "k", "v", updated_by="a")
+    result = _dispatch(
+        store,
+        "agenthold_clear_namespace",
+        {"namespace": "ns", "deleted_by": "cleanup"},
+    )
+    text = json.dumps(result, indent=2)  # must not raise
+    parsed = json.loads(text)
+    assert parsed["status"] == "ok"

@@ -343,3 +343,70 @@ def test_set_and_get_boolean_value(store: StateStore) -> None:
 def test_close_does_not_raise() -> None:
     store = StateStore(":memory:")
     store.close()  # should complete without error
+
+
+# ---------------------------------------------------------------------------
+# clear_namespace
+# ---------------------------------------------------------------------------
+
+
+def test_clear_namespace_deletes_all_keys(store: StateStore) -> None:
+    store.set("ns", "k1", "v1", updated_by="a")
+    store.set("ns", "k2", "v2", updated_by="a")
+    store.clear_namespace("ns", deleted_by="cleanup")
+    assert store.list_keys("ns") == []
+    for key in ("k1", "k2"):
+        with pytest.raises(NotFoundError):
+            store.get("ns", key)
+
+
+def test_clear_namespace_returns_deleted_keys(store: StateStore) -> None:
+    # Insert in non-alphabetical order to verify ORDER BY key
+    store.set("ns", "gamma", "v1", updated_by="a")
+    store.set("ns", "alpha", "v2", updated_by="a")
+    store.set("ns", "beta", "v3", updated_by="a")
+    result = store.clear_namespace("ns", deleted_by="cleanup")
+    assert result == ["alpha", "beta", "gamma"]
+
+
+def test_clear_namespace_empty_namespace(store: StateStore) -> None:
+    result = store.clear_namespace("nonexistent", deleted_by="cleanup")
+    assert result == []
+
+
+def test_clear_namespace_tombstones_in_history(store: StateStore) -> None:
+    # 3 keys; k2 written twice so its version is 2, proving tombstones
+    # capture the live version rather than a hardcoded value
+    store.set("ns", "k1", "v1", updated_by="a")
+    store.set("ns", "k2", "v1", updated_by="a")
+    store.set("ns", "k2", "v2", updated_by="a")  # k2 now at version 2
+    store.set("ns", "k3", "v1", updated_by="a")
+    store.clear_namespace("ns", deleted_by="cleaner")
+    for key in ("k1", "k2", "k3"):
+        tombstone = store.history("ns", key)[0]
+        assert tombstone.event_type == "delete"
+        assert tombstone.updated_by == "cleaner"
+        assert tombstone.value is None
+    assert store.history("ns", "k1")[0].version == 1
+    assert store.history("ns", "k2")[0].version == 2
+    assert store.history("ns", "k3")[0].version == 1
+
+
+def test_clear_namespace_does_not_affect_other_namespaces(
+    store: StateStore,
+) -> None:
+    store.set("ns-a", "key", "value", updated_by="a")
+    store.set("ns-b", "key", "value", updated_by="a")
+    store.clear_namespace("ns-a", deleted_by="cleanup")
+    # Live record in ns-b is unaffected
+    assert store.get("ns-b", "key").value == "value"
+    # No spurious tombstones in ns-b history
+    history = store.history("ns-b", "key")
+    assert all(h.event_type == "write" for h in history)
+
+
+def test_clear_namespace_is_idempotent(store: StateStore) -> None:
+    store.set("ns", "key", "value", updated_by="a")
+    store.clear_namespace("ns", deleted_by="cleanup")
+    result = store.clear_namespace("ns", deleted_by="cleanup")
+    assert result == []

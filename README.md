@@ -96,7 +96,7 @@ except ConflictError as e:
 
 ## Tools
 
-agenthold exposes six tools over the Model Context Protocol.
+agenthold exposes seven tools over the Model Context Protocol.
 
 ### `agenthold_get`
 
@@ -327,6 +327,43 @@ Wait for a key's version to change, then return the new value. Polls every 200 m
 | `N` (from a prior `agenthold_get`) | Wait until the key has been updated beyond version N |
 
 Pass `timeout_seconds=0` to perform a single immediate check without sleeping — useful for an orchestrator that wants to know whether a key has changed between two other operations.
+
+---
+
+### `agenthold_clear_namespace`
+
+Delete all state records in a namespace in a single atomic operation. A tombstone is written to `agenthold_history` for every key removed.
+
+```json
+{
+  "namespace": "order-1234",
+  "deleted_by": "cleanup-agent"
+}
+```
+
+**Success:**
+```json
+{
+  "status": "ok",
+  "namespace": "order-1234",
+  "deleted_count": 3,
+  "deleted_keys": ["items", "status", "total"],
+  "deleted_by": "cleanup-agent"
+}
+```
+
+**Empty or nonexistent namespace** (not an error):
+```json
+{
+  "status": "ok",
+  "namespace": "order-1234",
+  "deleted_count": 0,
+  "deleted_keys": [],
+  "deleted_by": "cleanup-agent"
+}
+```
+
+`deleted_keys` is sorted alphabetically. This operation has no conflict guard — it deletes unconditionally. If `deleted_keys` contains unexpected entries, use `agenthold_history` on those keys to investigate what was written and by whom.
 
 ---
 

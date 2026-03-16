@@ -7,6 +7,17 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.6] - 2026-03-16
+
+### Added
+- `agenthold_clear_namespace` MCP tool: atomically deletes all live records in a
+  namespace in a single transaction, writing a tombstone to `state_history` for
+  every key so the full lifecycle remains auditable
+- `StateStore.clear_namespace()` returns the sorted list of deleted key names;
+  returns an empty list (not an error) if the namespace has no records
+
+---
+
 ## [0.1.5] - 2026-03-16
 
 ### Added

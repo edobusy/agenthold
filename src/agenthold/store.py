@@ -13,6 +13,11 @@ Delete order (atomic within a transaction):
   1. INSERT tombstone into state_history (event_type='delete', value=JSON null)
   2. DELETE from state_records
 
+Clear order (atomic within a single transaction, all keys in a namespace):
+  1. SELECT all live keys and versions for the namespace
+  2. executemany INSERT tombstones into state_history for each key
+  3. DELETE all rows from state_records WHERE namespace = ?
+
 Conflict detection uses optimistic concurrency control (OCC):
   The caller passes expected_version. If the stored version differs,
   we raise ConflictError without writing. The caller re-reads and retries.
@@ -323,6 +328,57 @@ class StateStore:
                 (namespace, key),
             )
         return current_version
+
+    def clear_namespace(
+        self,
+        namespace: str,
+        deleted_by: str,
+    ) -> list[str]:
+        """Delete all live records in a namespace.
+
+        Writes a tombstone to state_history for each deleted record before
+        removing the live record (history-first invariant). All changes are
+        atomic within a single transaction.
+
+        Returns a list of the key names that were deleted, sorted alphabetically.
+        Returns an empty list if the namespace has no live records.
+        """
+        with self._transaction() as conn:
+            now = self._now()
+
+            rows = conn.execute(
+                "SELECT key, version FROM state_records "
+                "WHERE namespace = ? ORDER BY key",
+                (namespace,),
+            ).fetchall()
+
+            if not rows:
+                return []
+
+            tombstones = [
+                (
+                    namespace,
+                    row["key"],
+                    json.dumps(None),
+                    row["version"],
+                    deleted_by,
+                    now,
+                )
+                for row in rows
+            ]
+            conn.executemany(
+                "INSERT INTO state_history "
+                "(namespace, key, value, version, updated_by, updated_at, event_type) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'delete')",
+                tombstones,
+            )
+
+            conn.execute(
+                "DELETE FROM state_records WHERE namespace = ?",
+                (namespace,),
+            )
+
+        return [row["key"] for row in rows]
 
     def close(self) -> None:
         self._conn.close()
