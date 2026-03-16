@@ -233,10 +233,10 @@ async def test_watch_since_version_zero_key_already_at_version_one(
 
 
 @pytest.mark.parametrize("ns,key", [("", "k"), ("ns", ""), ("", "")])
-async def test_watch_empty_namespace_or_key_allowed(
+async def test_watch_empty_namespace_or_key_rejected(
     store: StateStore, ns: str, key: str
 ) -> None:
-    """Empty strings are accepted — consistent with existing tool behaviour."""
+    """Empty strings are rejected by input validation."""
     result = await _watch(store, ns, key, since_version=0, timeout_seconds=0)
-    # No error for empty strings; may return timeout (key doesn't exist)
-    assert result["status"] in ("ok", "timeout")
+    assert result["status"] == "error"
+    assert "must not be empty" in result["message"]

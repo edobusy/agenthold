@@ -72,6 +72,19 @@ CREATE INDEX IF NOT EXISTS idx_history_ns_key
 """
 
 
+_MAX_IDENTIFIER_LENGTH = 512
+
+
+def _validate_identifier(value: str, name: str) -> None:
+    """Validate a namespace or key string."""
+    if not value:
+        raise ValueError(f"{name} must not be empty")
+    if "\x00" in value:
+        raise ValueError(f"{name} must not contain null bytes")
+    if len(value) > _MAX_IDENTIFIER_LENGTH:
+        raise ValueError(f"{name} must not exceed {_MAX_IDENTIFIER_LENGTH} characters")
+
+
 class StateStore:
     """SQLite-backed state store with optimistic concurrency control.
 
@@ -165,6 +178,8 @@ class StateStore:
 
     def get(self, namespace: str, key: str) -> StateRecord:
         """Return the current state record. Raises NotFoundError if absent."""
+        _validate_identifier(namespace, "namespace")
+        _validate_identifier(key, "key")
         with self._lock:
             row = self._conn.execute(
                 "SELECT * FROM state_records WHERE namespace = ? AND key = ?",
@@ -198,7 +213,12 @@ class StateStore:
         If expected_version is None, the write is unconditional (use for
         first writes or deliberate overwrites).
         """
-        value_json = json.dumps(value)
+        _validate_identifier(namespace, "namespace")
+        _validate_identifier(key, "key")
+        try:
+            value_json = json.dumps(value)
+        except TypeError as e:
+            raise ValueError(f"Value is not JSON-serialisable: {e}") from e
 
         with self._transaction() as conn:
             now = self._now()
@@ -262,6 +282,7 @@ class StateStore:
 
     def list_keys(self, namespace: str) -> list[StateRecord]:
         """Return all current records in a namespace."""
+        _validate_identifier(namespace, "namespace")
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM state_records WHERE namespace = ? ORDER BY key",
@@ -289,6 +310,8 @@ class StateStore:
         version descending — tombstones share the version of the live record
         they deleted, so id is the only unambiguous ordering.
         """
+        _validate_identifier(namespace, "namespace")
+        _validate_identifier(key, "key")
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM state_history "
@@ -326,6 +349,8 @@ class StateStore:
         state_history recording deleted_by and the version that was deleted.
         The live record is removed. Prior history entries are preserved.
         """
+        _validate_identifier(namespace, "namespace")
+        _validate_identifier(key, "key")
         with self._transaction() as conn:
             now = self._now()
             existing = conn.execute(
@@ -386,6 +411,7 @@ class StateStore:
         Returns a list of the key names that were deleted, sorted alphabetically.
         Returns an empty list if the namespace has no live records.
         """
+        _validate_identifier(namespace, "namespace")
         with self._transaction() as conn:
             now = self._now()
 
@@ -447,6 +473,7 @@ class StateStore:
 
         Returns (exported_at, []) if the namespace has no live records.
         """
+        _validate_identifier(namespace, "namespace")
         with self._read_transaction() as conn:
             exported_at = self._now()
 

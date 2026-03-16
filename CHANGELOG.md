@@ -7,6 +7,33 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.2.0] - 2026-03-16
+
+### Breaking Changes
+- **`agenthold_set`**: `expected_version` is now a required parameter. Agents must
+  pass the version from a prior `agenthold_get` (or `0` for a key that should not
+  yet exist). To write unconditionally, set the new `force=true` parameter instead
+  of omitting `expected_version`.
+- **`agenthold_delete`**: `expected_version` is now a required parameter. Same
+  pattern: pass the version from a prior read, or set `force=true` to delete
+  unconditionally.
+
+### Added
+- `force` boolean parameter on `agenthold_set` and `agenthold_delete`: bypasses
+  conflict detection when set to `true`; `expected_version` is ignored in this mode
+- Input validation for `namespace` and `key` across all tools: rejects empty strings,
+  strings containing null bytes, and strings exceeding 512 characters; returns a
+  structured `{"status": "error", "message": "..."}` response
+- `json.dumps` `TypeError` in `store.set()` is now caught and re-raised as
+  `ValueError`, producing a structured error response instead of an unhandled
+  exception
+- `ValueError` catch in `_dispatch` and `_watch`: all validation errors from the
+  store layer now surface as `{"status": "error", "message": "..."}` responses
+- Tests for: `force` parameter (set + delete), input validation (empty, null bytes,
+  overlength), non-serialisable values, dispatch-layer error responses
+
+---
+
 ## [0.1.8] - 2026-03-16
 
 ### Fixed

@@ -127,7 +127,7 @@ Returns `{"status": "not_found"}` if the key does not exist. No exception is rai
 
 ### `agenthold_set`
 
-Write a value. Pass `expected_version` to enable conflict detection.
+Write a value. `expected_version` is required — pass the version from a prior `agenthold_get`, or `0` for a key that should not yet exist.
 
 ```json
 {
@@ -168,11 +168,21 @@ Write a value. Pass `expected_version` to enable conflict detection.
 
 | Value | Behaviour |
 |---|---|
-| Omitted | Unconditional write — overwrites any concurrent change without warning |
 | `0` | Create-only guard — succeeds only if the key does not yet exist; conflicts if it does |
 | `N` (from a prior `agenthold_get`) | Conflict-safe write — rejected if another agent wrote since your read |
 
-Pass `expected_version=0` when initialising shared state that should only be written once. Omit it only for deliberate unconditional overwrites.
+**`force` parameter:** Set `force: true` to write unconditionally, bypassing conflict detection. When `force` is true, `expected_version` is ignored. Use this only for idempotent writes or initial seeding where overwriting is intentional.
+
+```json
+{
+  "namespace": "order-1234",
+  "key": "status",
+  "value": "shipped",
+  "updated_by": "logistics-agent",
+  "expected_version": 0,
+  "force": true
+}
+```
 
 ---
 
@@ -275,7 +285,7 @@ Permanently remove a state record. The deletion is written as a tombstone in `ag
 }
 ```
 
-Pass `expected_version` (from a prior `agenthold_get`) to prevent accidentally deleting a record that was updated since your read. Omit it to delete unconditionally.
+`expected_version` is required — pass the version from a prior `agenthold_get` to prevent accidentally deleting a record that was updated since your read. Set `force: true` to delete unconditionally (bypasses conflict detection; `expected_version` is ignored).
 
 ---
 

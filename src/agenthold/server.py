@@ -3,7 +3,7 @@ Agenthold MCP server.
 
 Exposes eight tools over the Model Context Protocol:
   agenthold_get             : read a state record
-  agenthold_set             : write a state record (with optional conflict detection)
+  agenthold_set             : write a state record (with conflict detection)
   agenthold_list            : list all keys in a namespace
   agenthold_history         : read the version history of a key
   agenthold_delete          : permanently delete a state record
@@ -37,7 +37,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
 from agenthold.exceptions import BusyError, ConflictError, NotFoundError
-from agenthold.store import StateStore
+from agenthold.store import StateStore, _validate_identifier
 
 _NS_FIELD: dict[str, str] = {
     "type": "string",
@@ -62,9 +62,9 @@ def make_server(db_path: str | Path) -> Server:
                     "Read the current value of a state record. "
                     "Returns the value, version number, and metadata. "
                     "Always pass the returned version as expected_version in a "
-                    "subsequent agenthold_set call to enable conflict detection. "
-                    "If you omit expected_version in agenthold_set, your write will "
-                    "silently overwrite any concurrent changes without warning. "
+                    "subsequent agenthold_set call for conflict detection. "
+                    "If you set force=true in agenthold_set, your write will "
+                    "bypass conflict detection and overwrite without warning. "
                     "If the key does not exist, the response has status 'not_found' "
                     "with no version — use expected_version=0 in agenthold_set to "
                     "write only if the key is still absent."
@@ -82,14 +82,17 @@ def make_server(db_path: str | Path) -> Server:
                 name="agenthold_set",
                 description=(
                     "Write a value to a state record. "
-                    "Pass expected_version (from a prior agenthold_get) to enable "
-                    "conflict detection — if another agent wrote since your read, "
-                    "you will receive a conflict response with the current state "
-                    "so you can re-read and retry. "
+                    "expected_version is required. Pass the version from a prior "
+                    "agenthold_get (or 0 for a key that should not yet exist). "
+                    "If the stored version has changed since your read, you will "
+                    "receive a conflict response with the current state so you "
+                    "can re-read and retry. "
                     "Pass expected_version=0 to write only if the key does not "
                     "yet exist (create-only guard). "
-                    "Omit expected_version entirely to write unconditionally, "
-                    "overwriting any concurrent changes without warning. "
+                    "To write unconditionally (bypassing conflict detection), "
+                    "set force=true — this is rarely needed and should only be "
+                    "used for idempotent writes or initial seeding. "
+                    "When force is true, expected_version is ignored. "
                     "On success, the response includes the new version — use it "
                     "directly as expected_version for subsequent writes without "
                     "calling agenthold_get again. "
@@ -114,11 +117,29 @@ def make_server(db_path: str | Path) -> Server:
                             "description": (
                                 "The version you read before making your changes. "
                                 "If the stored version has changed since your read, "
-                                "the write will be rejected with a conflict response."
+                                "the write will be rejected with a conflict response. "
+                                "Pass 0 for a key that should not yet exist."
+                            ),
+                        },
+                        "force": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": (
+                                "Set to true to write unconditionally, bypassing "
+                                "conflict detection. Use this only for idempotent "
+                                "writes or initial seeding where overwriting is "
+                                "intentional. When force is true, expected_version "
+                                "is ignored."
                             ),
                         },
                     },
-                    "required": ["namespace", "key", "value", "updated_by"],
+                    "required": [
+                        "namespace",
+                        "key",
+                        "value",
+                        "updated_by",
+                        "expected_version",
+                    ],
                 },
             ),
             Tool(
@@ -178,9 +199,15 @@ def make_server(db_path: str | Path) -> Server:
                     "remains auditable. "
                     "Returns not_found if the key does not exist — this is not "
                     "an error; the key is absent either way. "
-                    "Pass expected_version (from a prior agenthold_get) to prevent "
-                    "accidentally deleting a record that was updated since your "
-                    "read. Omit expected_version to delete unconditionally."
+                    "expected_version is required. Pass the version from a prior "
+                    "agenthold_get to prevent accidentally deleting a record that "
+                    "was updated since your read. "
+                    "To delete unconditionally (bypassing conflict detection), "
+                    "set force=true. When force is true, expected_version is "
+                    "ignored. "
+                    "Do not pass expected_version=0 — unlike agenthold_set, "
+                    "version 0 means the key does not exist and any live key "
+                    "will always conflict."
                 ),
                 inputSchema={
                     "type": "object",
@@ -204,8 +231,17 @@ def make_server(db_path: str | Path) -> Server:
                                 "will always conflict."
                             ),
                         },
+                        "force": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": (
+                                "Set to true to delete unconditionally, bypassing "
+                                "conflict detection. When force is true, "
+                                "expected_version is ignored."
+                            ),
+                        },
                     },
-                    "required": ["namespace", "key", "deleted_by"],
+                    "required": ["namespace", "key", "deleted_by", "expected_version"],
                 },
             ),
             Tool(
@@ -370,6 +406,8 @@ def _dispatch(store: StateStore, name: str, args: dict[str, Any]) -> dict[str, A
             "message": ("The database is temporarily locked by another writer."),
             "hint": "Retry the operation after a short delay.",
         }
+    except ValueError as e:
+        return {"status": "error", "message": str(e)}
 
 
 def _dispatch_tool(
@@ -397,16 +435,16 @@ def _dispatch_tool(
 
     elif name == "agenthold_set":
         try:
+            if args.get("force", False):
+                expected_version = None
+            else:
+                expected_version = int(args["expected_version"])
             result = store.set(
                 namespace=args["namespace"],
                 key=args["key"],
                 value=args["value"],
                 updated_by=args["updated_by"],
-                expected_version=(
-                    int(args["expected_version"])
-                    if "expected_version" in args
-                    else None
-                ),
+                expected_version=expected_version,
             )
             return {
                 "status": "ok",
@@ -478,15 +516,15 @@ def _dispatch_tool(
 
     elif name == "agenthold_delete":
         try:
+            if args.get("force", False):
+                expected_version = None
+            else:
+                expected_version = int(args["expected_version"])
             deleted_version = store.delete(
                 namespace=args["namespace"],
                 key=args["key"],
                 deleted_by=args["deleted_by"],
-                expected_version=(
-                    int(args["expected_version"])
-                    if "expected_version" in args
-                    else None
-                ),
+                expected_version=expected_version,
             )
             if deleted_version is None:
                 return {
@@ -576,6 +614,11 @@ async def _watch(
     timeout_seconds: float,
 ) -> dict[str, Any]:
     """Async polling loop. Called directly from call_tool, not via _dispatch."""
+    try:
+        _validate_identifier(namespace, "namespace")
+        _validate_identifier(key, "key")
+    except ValueError as e:
+        return {"status": "error", "message": str(e)}
     if since_version < 0:
         return {"status": "error", "message": "since_version must be >= 0"}
     if timeout_seconds < 0:

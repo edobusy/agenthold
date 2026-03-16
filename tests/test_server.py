@@ -83,7 +83,13 @@ def test_dispatch_set_new_key(store: StateStore) -> None:
     result = _dispatch(
         store,
         "agenthold_set",
-        {"namespace": "ns", "key": "k", "value": 42, "updated_by": "agent"},
+        {
+            "namespace": "ns",
+            "key": "k",
+            "value": 42,
+            "updated_by": "agent",
+            "expected_version": 0,
+        },
     )
     assert result["status"] == "ok"
     assert result["version"] == 1
@@ -228,10 +234,16 @@ def test_all_expected_tools_are_handled_by_dispatch() -> None:
             "key": "k2",
             "value": 1,
             "updated_by": "a",
+            "expected_version": 0,
         },
         "agenthold_list": {"namespace": "ns"},
         "agenthold_history": {"namespace": "ns", "key": "k"},
-        "agenthold_delete": {"namespace": "ns", "key": "k", "deleted_by": "a"},
+        "agenthold_delete": {
+            "namespace": "ns",
+            "key": "k",
+            "deleted_by": "a",
+            "expected_version": 1,
+        },
         "agenthold_clear_namespace": {"namespace": "ns", "deleted_by": "a"},
         "agenthold_export": {"namespace": "ns"},
     }
@@ -257,7 +269,12 @@ def test_dispatch_delete_existing_key(store: StateStore) -> None:
     result = _dispatch(
         store,
         "agenthold_delete",
-        {"namespace": "ns", "key": "k", "deleted_by": "cleanup"},
+        {
+            "namespace": "ns",
+            "key": "k",
+            "deleted_by": "cleanup",
+            "expected_version": 1,
+        },
     )
     assert result["status"] == "ok"
     assert result["namespace"] == "ns"
@@ -270,7 +287,12 @@ def test_dispatch_delete_missing_key(store: StateStore) -> None:
     result = _dispatch(
         store,
         "agenthold_delete",
-        {"namespace": "ns", "key": "missing", "deleted_by": "cleanup"},
+        {
+            "namespace": "ns",
+            "key": "missing",
+            "deleted_by": "cleanup",
+            "force": True,
+        },
     )
     assert result["status"] == "not_found"
     assert result["namespace"] == "ns"
@@ -298,7 +320,12 @@ def test_dispatch_delete_tombstone_visible_in_history(store: StateStore) -> None
     _dispatch(
         store,
         "agenthold_delete",
-        {"namespace": "ns", "key": "k", "deleted_by": "cleanup"},
+        {
+            "namespace": "ns",
+            "key": "k",
+            "deleted_by": "cleanup",
+            "expected_version": 1,
+        },
     )
     result = _dispatch(store, "agenthold_history", {"namespace": "ns", "key": "k"})
     assert result["history"][0]["event_type"] == "delete"
@@ -422,3 +449,127 @@ def test_dispatch_export_namespace_output_is_json_serialisable(
     tombstones = [e for e in history if e["event_type"] == "delete"]
     assert len(tombstones) == 1
     assert tombstones[0]["value"] is None
+
+
+# ---------------------------------------------------------------------------
+# Item 5 — required expected_version + force parameter
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_set_with_force_bypasses_occ(store: StateStore) -> None:
+    store.set("ns", "k", "v1", updated_by="a")
+    result = _dispatch(
+        store,
+        "agenthold_set",
+        {
+            "namespace": "ns",
+            "key": "k",
+            "value": "v2",
+            "updated_by": "b",
+            "expected_version": 999,
+            "force": True,
+        },
+    )
+    assert result["status"] == "ok"
+    assert result["version"] == 2
+
+
+def test_dispatch_set_force_without_expected_version(store: StateStore) -> None:
+    result = _dispatch(
+        store,
+        "agenthold_set",
+        {
+            "namespace": "ns",
+            "key": "k",
+            "value": "v1",
+            "updated_by": "a",
+            "force": True,
+        },
+    )
+    assert result["status"] == "ok"
+    assert result["version"] == 1
+
+
+def test_dispatch_delete_with_force_bypasses_occ(store: StateStore) -> None:
+    store.set("ns", "k", "v1", updated_by="a")
+    store.set("ns", "k", "v2", updated_by="a")
+    result = _dispatch(
+        store,
+        "agenthold_delete",
+        {
+            "namespace": "ns",
+            "key": "k",
+            "deleted_by": "cleanup",
+            "expected_version": 1,
+            "force": True,
+        },
+    )
+    assert result["status"] == "ok"
+    assert result["deleted_version"] == 2
+
+
+def test_dispatch_delete_force_without_expected_version(store: StateStore) -> None:
+    store.set("ns", "k", "v1", updated_by="a")
+    result = _dispatch(
+        store,
+        "agenthold_delete",
+        {
+            "namespace": "ns",
+            "key": "k",
+            "deleted_by": "cleanup",
+            "force": True,
+        },
+    )
+    assert result["status"] == "ok"
+    assert result["deleted_version"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Item 6 — Input validation at dispatch layer
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_empty_namespace_returns_error(store: StateStore) -> None:
+    result = _dispatch(store, "agenthold_get", {"namespace": "", "key": "k"})
+    assert result["status"] == "error"
+    assert "namespace" in result["message"]
+    assert "must not be empty" in result["message"]
+
+
+def test_dispatch_empty_key_returns_error(store: StateStore) -> None:
+    result = _dispatch(store, "agenthold_get", {"namespace": "ns", "key": ""})
+    assert result["status"] == "error"
+    assert "key" in result["message"]
+
+
+def test_dispatch_null_byte_in_namespace_returns_error(store: StateStore) -> None:
+    result = _dispatch(store, "agenthold_get", {"namespace": "ns\x00bad", "key": "k"})
+    assert result["status"] == "error"
+    assert "null bytes" in result["message"]
+
+
+def test_dispatch_overlength_namespace_returns_error(store: StateStore) -> None:
+    result = _dispatch(store, "agenthold_get", {"namespace": "x" * 600, "key": "k"})
+    assert result["status"] == "error"
+    assert "512" in result["message"]
+
+
+# ---------------------------------------------------------------------------
+# Item 7 — json.dumps failure returns structured error
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_non_serialisable_value_returns_error(store: StateStore) -> None:
+    result = _dispatch(
+        store,
+        "agenthold_set",
+        {
+            "namespace": "ns",
+            "key": "k",
+            "value": {1, 2, 3},  # sets are not JSON-serialisable
+            "updated_by": "a",
+            "expected_version": 0,
+        },
+    )
+    assert result["status"] == "error"
+    assert "JSON" in result["message"] or "seriali" in result["message"]

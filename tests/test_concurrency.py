@@ -238,6 +238,7 @@ def test_dispatch_busy_error_returns_structured_response() -> None:
                 "key": "k",
                 "value": "v2",
                 "updated_by": "b",
+                "expected_version": 1,
             },
         )
     assert result["status"] == "busy"

@@ -346,6 +346,80 @@ def test_close_does_not_raise() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Input validation (item 6)
+# ---------------------------------------------------------------------------
+
+
+def test_empty_namespace_raises_value_error(store: StateStore) -> None:
+    with pytest.raises(ValueError, match="namespace must not be empty"):
+        store.get("", "key")
+
+
+def test_empty_key_raises_value_error(store: StateStore) -> None:
+    with pytest.raises(ValueError, match="key must not be empty"):
+        store.get("ns", "")
+
+
+def test_null_byte_in_namespace_raises_value_error(store: StateStore) -> None:
+    with pytest.raises(ValueError, match="null bytes"):
+        store.set("ns\x00bad", "key", "v", updated_by="a")
+
+
+def test_null_byte_in_key_raises_value_error(store: StateStore) -> None:
+    with pytest.raises(ValueError, match="null bytes"):
+        store.set("ns", "key\x00bad", "v", updated_by="a")
+
+
+def test_overlength_namespace_raises_value_error(store: StateStore) -> None:
+    with pytest.raises(ValueError, match="512"):
+        store.get("x" * 600, "key")
+
+
+def test_overlength_key_raises_value_error(store: StateStore) -> None:
+    with pytest.raises(ValueError, match="512"):
+        store.get("ns", "k" * 600)
+
+
+def test_validation_applies_to_all_public_methods(store: StateStore) -> None:
+    """Every public method that takes namespace must reject empty strings."""
+    for method_name in (
+        "get",
+        "set",
+        "list_keys",
+        "history",
+        "delete",
+        "clear_namespace",
+        "export_namespace",
+    ):
+        method = getattr(store, method_name)
+        try:
+            # Pass empty namespace with enough args to reach validation
+            if method_name in ("get", "history"):
+                method("", "key")
+            elif method_name in ("set",):
+                method("", "key", "value", updated_by="a")
+            elif method_name in ("delete",):
+                method("", "key", deleted_by="a")
+            elif method_name in ("clear_namespace",):
+                method("", deleted_by="a")
+            elif method_name in ("list_keys", "export_namespace"):
+                method("")
+            raise AssertionError(f"{method_name} did not raise ValueError")
+        except ValueError as e:
+            assert "namespace must not be empty" in str(e)
+
+
+# ---------------------------------------------------------------------------
+# json.dumps failure (item 7)
+# ---------------------------------------------------------------------------
+
+
+def test_set_non_serialisable_value_raises_value_error(store: StateStore) -> None:
+    with pytest.raises(ValueError, match="JSON"):
+        store.set("ns", "key", {1, 2, 3}, updated_by="a")
+
+
+# ---------------------------------------------------------------------------
 # clear_namespace
 # ---------------------------------------------------------------------------
 
