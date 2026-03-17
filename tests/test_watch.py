@@ -2,9 +2,11 @@
 
 import asyncio
 import json
+from unittest.mock import patch
 
 import pytest
 
+from agenthold.exceptions import BusyError
 from agenthold.server import _watch
 from agenthold.store import StateStore
 
@@ -240,3 +242,25 @@ async def test_watch_empty_namespace_or_key_rejected(
     result = await _watch(store, ns, key, since_version=0, timeout_seconds=0)
     assert result["status"] == "error"
     assert "must not be empty" in result["message"]
+
+
+async def test_watch_survives_transient_busy_error(store: StateStore) -> None:
+    """BusyError during polling should not crash — watch keeps polling."""
+    store.set("ns", "k", "v1", updated_by="agent")
+
+    real_get = store.get
+    call_count = 0
+
+    def flaky_get(namespace: str, key: str) -> object:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise BusyError()
+        return real_get(namespace, key)
+
+    with patch.object(store, "get", side_effect=flaky_get):
+        result = await _watch(store, "ns", "k", since_version=0, timeout_seconds=5.0)
+
+    assert result["status"] == "ok"
+    assert result["version"] == 1
+    assert call_count >= 2

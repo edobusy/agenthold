@@ -7,6 +7,41 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.3.0] - 2026-03-17
+
+### Added
+- **Plug-and-play coordination layer**: four high-level tools that work out of the
+  box with zero configuration — no CLAUDE.md, no system prompt changes, no namespace
+  design required
+  - `agenthold_claim`: claim exclusive access to a resource before modifying it
+  - `agenthold_release`: release a claim when done, immediately notifying waiting agents
+  - `agenthold_status`: check whether a resource is available or held by another agent
+  - `agenthold_wait`: block until a claimed resource becomes available (async poll loop)
+- `Coordinator` class (`coordinator.py`): implements the claim lifecycle (unclaimed →
+  claimed → free) on top of `StateStore` with OCC conflict handling and single-retry
+  race recovery
+- **Resource normalization**: `./intro.md`, `intro.md`, and `src\\main.py` all resolve
+  to the same claim key (strips `./`, collapses slashes, normalizes backslashes)
+- **MCP server instructions**: `COORDINATION_INSTRUCTIONS` constant embedded in
+  `server.py`, returned to every MCP client on connection as reinforcement. Tool
+  descriptions carry the protocol independently — if the client drops these
+  instructions, the system still works.
+- `--tools` CLI flag: `standard` (default, 4 high-level tools) or `advanced` (8
+  low-level primitives). The store layer is identical in both modes.
+- **Release-by-version-bump**: releasing a claim writes a `"free"` state (version
+  bump) instead of deleting the key, so `agenthold_wait` fires immediately on
+  release instead of timing out
+- **Mode-mixing safety**: if an advanced-mode agent writes a non-claim value to the
+  `"claims"` namespace, the coordinator treats it as unclaimed and overwrites with
+  a proper claim structure on the next claim
+
+### Changed
+- Default tool set is now `standard` (4 high-level tools). Use `--tools advanced`
+  for the 8 low-level primitives from v0.2.0. No breaking changes to the primitive
+  tools — they are all still available in advanced mode.
+
+---
+
 ## [0.2.0] - 2026-03-16
 
 ### Breaking Changes

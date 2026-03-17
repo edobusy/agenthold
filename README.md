@@ -41,13 +41,13 @@ OCC is the right fit for agent workflows because:
 
 ## Quick start
 
-### Install
+### 1. Install
 
 ```bash
 pip install agenthold
 ```
 
-### Add to your MCP client config
+### 2. Add to your MCP client config
 
 ```json
 {
@@ -60,43 +60,126 @@ pip install agenthold
 }
 ```
 
+### 3. Done
+
+Agents automatically coordinate. No CLAUDE.md, no system prompt changes, no namespace design.
+
+When an agent connects, it sees four self-documenting tools: `agenthold_claim`, `agenthold_release`, `agenthold_status`, and `agenthold_wait`. The tool descriptions tell the agent when and how to use each one. Server instructions reinforce the protocol when the MCP client includes them.
+
 Works with Claude Desktop, Cursor, Continue, and any MCP-compatible client.
-
-### Use as a Python library
-
-```python
-from agenthold.store import StateStore
-from agenthold.exceptions import ConflictError
-
-store = StateStore("./state.db")
-
-# Write a value (first write, no conflict check needed)
-store.set("order-1234", "status", "received", updated_by="intake-agent")
-
-# Read it back; always get the version number too
-record = store.get("order-1234", "status")
-print(record.value)    # "received"
-print(record.version)  # 1
-
-# Write with conflict detection; pass the version you read
-try:
-    store.set(
-        "order-1234", "status", "processing",
-        updated_by="fulfillment-agent",
-        expected_version=record.version,  # rejected if another agent wrote first
-    )
-except ConflictError as e:
-    # Another agent wrote between your read and write.
-    # e.detail has the current version, value, and who wrote it.
-    record = store.get("order-1234", "status")
-    # ... recalculate and retry
-```
 
 ---
 
 ## Tools
 
-agenthold exposes eight tools over the Model Context Protocol.
+agenthold exposes four coordination tools by default.
+
+### `agenthold_claim`
+
+Claim exclusive access to a resource before modifying it.
+
+```json
+{ "resource": "intro.md", "agent": "writer-1" }
+```
+
+**Claimed** — you hold exclusive access:
+```json
+{ "status": "claimed", "resource": "intro.md", "version": 1 }
+```
+
+**Busy** — another agent is working on this resource:
+```json
+{
+  "status": "busy",
+  "resource": "intro.md",
+  "held_by": "writer-2",
+  "claimed_at": "2026-03-17T10:00:00+00:00",
+  "hint": "Another agent holds this resource. Work on a different resource, or call agenthold_wait to be notified when it becomes available."
+}
+```
+
+**Already claimed** — you already hold this claim (idempotent):
+```json
+{ "status": "already_claimed", "resource": "intro.md", "version": 1 }
+```
+
+---
+
+### `agenthold_release`
+
+Release your claim after finishing edits. This immediately notifies any agents waiting via `agenthold_wait`.
+
+```json
+{ "resource": "intro.md", "agent": "writer-1" }
+```
+
+```json
+{ "status": "released", "resource": "intro.md", "version": 2 }
+```
+
+---
+
+### `agenthold_status`
+
+Check whether a resource is available or currently claimed.
+
+```json
+{ "resource": "intro.md" }
+```
+
+**Available:**
+```json
+{ "status": "available", "resource": "intro.md" }
+```
+
+**Claimed:**
+```json
+{
+  "status": "claimed",
+  "resource": "intro.md",
+  "held_by": "writer-2",
+  "claimed_at": "2026-03-17T10:00:00+00:00",
+  "version": 3
+}
+```
+
+---
+
+### `agenthold_wait`
+
+Wait for a claimed resource to become available. Blocks the agent turn until the holder releases, or the timeout expires.
+
+```json
+{ "resource": "intro.md", "timeout_seconds": 30 }
+```
+
+**Available** — resource was released:
+```json
+{ "status": "available", "resource": "intro.md", "elapsed_seconds": 2.4 }
+```
+
+**Timeout:**
+```json
+{
+  "status": "timeout",
+  "resource": "intro.md",
+  "held_by": "writer-2",
+  "elapsed_seconds": 30.2,
+  "hint": "The resource was not released within the timeout. Try working on a different resource, or call agenthold_wait again with a longer timeout."
+}
+```
+
+---
+
+## Advanced usage
+
+For power users building custom coordination protocols, agenthold exposes eight low-level primitives via `--tools advanced`:
+
+```bash
+agenthold --db ./state.db --tools advanced
+```
+
+This gives agents direct access to `agenthold_get`, `agenthold_set`, `agenthold_list`, `agenthold_history`, `agenthold_delete`, `agenthold_clear_namespace`, `agenthold_export`, and `agenthold_watch`. No server instructions are sent in this mode.
 
 ### `agenthold_get`
 
@@ -172,17 +255,6 @@ Write a value. `expected_version` is required — pass the version from a prior 
 | `N` (from a prior `agenthold_get`) | Conflict-safe write — rejected if another agent wrote since your read |
 
 **`force` parameter:** Set `force: true` to write unconditionally, bypassing conflict detection. When `force` is true, `expected_version` is ignored. Use this only for idempotent writes or initial seeding where overwriting is intentional.
-
-```json
-{
-  "namespace": "order-1234",
-  "key": "status",
-  "value": "shipped",
-  "updated_by": "logistics-agent",
-  "expected_version": 0,
-  "force": true
-}
-```
 
 ---
 
@@ -262,29 +334,6 @@ Permanently remove a state record. The deletion is written as a tombstone in `ag
 }
 ```
 
-**Key not found** (not an error — the key is absent either way):
-```json
-{
-  "status": "not_found",
-  "namespace": "order-1234",
-  "key": "status"
-}
-```
-
-**Conflict** (another agent wrote since your last read):
-```json
-{
-  "status": "conflict",
-  "namespace": "order-1234",
-  "key": "status",
-  "expected_version": 4,
-  "actual_version": 5,
-  "actual_updated_by": "fulfillment-agent",
-  "actual_updated_at": "2026-03-15T10:42:01.456+00:00",
-  "hint": "Call agenthold_get to read the current state, merge your changes, and retry with the new version."
-}
-```
-
 `expected_version` is required — pass the version from a prior `agenthold_get` to prevent accidentally deleting a record that was updated since your read. Set `force: true` to delete unconditionally (bypasses conflict detection; `expected_version` is ignored).
 
 ---
@@ -316,35 +365,12 @@ Export all live records and their complete version history for a namespace as a 
         {"version": 2, "value": "processing", "event_type": "write", "updated_by": "fulfillment-agent", "updated_at": "..."},
         {"version": 1, "value": "received",   "event_type": "write", "updated_by": "intake-agent",      "updated_at": "..."}
       ]
-    },
-    {
-      "key": "total",
-      "value": 99.99,
-      "version": 2,
-      "updated_by": "pricing-agent",
-      "updated_at": "2026-03-16T09:58:00+00:00",
-      "history": [
-        {"version": 2, "value": 99.99, "event_type": "write", "updated_by": "pricing-agent", "updated_at": "..."},
-        {"version": 1, "value": 89.99, "event_type": "write", "updated_by": "intake-agent",  "updated_at": "..."}
-      ]
     }
   ]
 }
 ```
 
 Records are sorted alphabetically by key. History entries are ordered newest first. `history_count` is the total across all keys and includes delete tombstones (which have `value: null`). Only live (non-deleted) keys are included; use `agenthold_history` to inspect deleted keys.
-
-**Empty or nonexistent namespace** (not an error):
-```json
-{
-  "status": "ok",
-  "namespace": "order-1234",
-  "exported_at": "2026-03-16T10:00:00.123456+00:00",
-  "record_count": 0,
-  "history_count": 0,
-  "records": []
-}
-```
 
 ---
 
@@ -388,15 +414,6 @@ Wait for a key's version to change, then return the new value. Polls every 200 m
 }
 ```
 
-**`since_version` patterns:**
-
-| Value | Behaviour |
-|---|---|
-| `0` | Wait for the very first write to a key (fires when version reaches 1) |
-| `N` (from a prior `agenthold_get`) | Wait until the key has been updated beyond version N |
-
-Pass `timeout_seconds=0` to perform a single immediate check without sleeping — useful for an orchestrator that wants to know whether a key has changed between two other operations.
-
 ---
 
 ### `agenthold_clear_namespace`
@@ -410,24 +427,12 @@ Delete all state records in a namespace in a single atomic operation. A tombston
 }
 ```
 
-**Success:**
 ```json
 {
   "status": "ok",
   "namespace": "order-1234",
   "deleted_count": 3,
   "deleted_keys": ["items", "status", "total"],
-  "deleted_by": "cleanup-agent"
-}
-```
-
-**Empty or nonexistent namespace** (not an error):
-```json
-{
-  "status": "ok",
-  "namespace": "order-1234",
-  "deleted_count": 0,
-  "deleted_keys": [],
   "deleted_by": "cleanup-agent"
 }
 ```
@@ -468,6 +473,38 @@ while True:
 
 ---
 
+## Use as a Python library
+
+```python
+from agenthold.store import StateStore
+from agenthold.exceptions import ConflictError
+
+store = StateStore("./state.db")
+
+# Write a value (first write, no conflict check needed)
+store.set("order-1234", "status", "received", updated_by="intake-agent")
+
+# Read it back; always get the version number too
+record = store.get("order-1234", "status")
+print(record.value)    # "received"
+print(record.version)  # 1
+
+# Write with conflict detection; pass the version you read
+try:
+    store.set(
+        "order-1234", "status", "processing",
+        updated_by="fulfillment-agent",
+        expected_version=record.version,  # rejected if another agent wrote first
+    )
+except ConflictError as e:
+    # Another agent wrote between your read and write.
+    # e.detail has the current version, value, and who wrote it.
+    record = store.get("order-1234", "status")
+    # ... recalculate and retry
+```
+
+---
+
 ## Examples
 
 Two worked examples are included, each with a "before" and "after" script.
@@ -501,12 +538,14 @@ uv run python examples/budget_allocation/with_agenthold.py
 ## Configuration
 
 ```bash
-agenthold --db ./state.db
+agenthold --db ./state.db                   # standard mode (default)
+agenthold --db ./state.db --tools advanced  # advanced mode
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `--db` | `./agenthold.db` | Path to the SQLite database file. Use `:memory:` for an in-process store (testing only; data is lost when the process exits). |
+| `--tools` | `standard` | Tool set: `standard` (claim/release/status/wait) or `advanced` (get/set/delete/watch/list/history/clear/export). |
 
 The database file is created automatically on first run. Back it up like any other SQLite file.
 
