@@ -7,6 +7,25 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.4.1] - 2026-03-18
+
+### Fixed
+- **Sequential claiming guidance**: `COORDINATION_INSTRUCTIONS` and
+  `agenthold_claim` tool description now tell agents to claim one resource at a
+  time, right before modifying it, and release before claiming the next. This
+  prevents greedy batch-claiming observed in real-world multi-agent sessions.
+- **Negative `claim_ttl` rejected**: `Coordinator.__init__` now raises
+  `ValueError` if `claim_ttl < 0`, preventing a configuration where all claims
+  instantly expire.
+- **`interpret_state` input validation**: now calls `_validate_inputs()` instead
+  of bare `_normalize_resource()`, so empty strings and null bytes are rejected
+  consistently with `claim`/`release`/`status`.
+- **`ConflictError` safety net in standard dispatch**: `_dispatch_standard` now
+  catches `ConflictError` from the coordinator layer and returns a structured
+  error with retry hint, instead of crashing the server.
+
+---
+
 ## [0.4.0] - 2026-03-18
 
 ### Breaking Changes
