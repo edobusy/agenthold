@@ -87,12 +87,14 @@ RULES:
 
 1. BEFORE modifying any file or shared resource, call agenthold_claim \
    with the resource path and your agent_id. Do not proceed until \
-   the claim is granted.
+   the claim is granted. Claim each resource right before you modify \
+   it — do not claim multiple resources in advance.
 
 2. If agenthold_claim returns "busy", do NOT modify the resource. \
    Choose a different resource, or call agenthold_wait.
 
-3. AFTER finishing modifications, call agenthold_release immediately.
+3. AFTER finishing modifications, call agenthold_release immediately. \
+   Release before claiming your next resource.
 
 4. Use the filename as the resource identifier for files \
    (e.g. "intro.md", "src/main.py").\
@@ -144,6 +146,9 @@ def _standard_tools() -> list[Tool]:
                 "shared resource when other agents may be working in the "
                 "same environment. Do not proceed with modifications until "
                 "the claim is granted. "
+                "Claim each resource right before you modify it — do not "
+                "claim multiple resources in advance. Finish editing and "
+                "release one resource before claiming the next. "
                 "You must call agenthold_register first to get an agent_id. "
                 "Pass the filename as the resource identifier (e.g. "
                 '"intro.md", "src/main.py"). '
