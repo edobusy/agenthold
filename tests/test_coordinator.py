@@ -2,7 +2,7 @@
 
 import json
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import pytest
@@ -16,6 +16,11 @@ from agenthold.store import StateStore
 @pytest.fixture
 def coordinator(store: StateStore) -> Coordinator:
     return Coordinator(store)
+
+
+@pytest.fixture
+def ttl_coordinator(store: StateStore) -> Coordinator:
+    return Coordinator(store, claim_ttl=60.0)
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +295,18 @@ class TestInterpretState:
         state = coordinator.interpret_state("intro.md")
         assert state["state"] == "unclaimed"
 
+    def test_validates_empty_resource(self, coordinator: Coordinator) -> None:
+        with pytest.raises(ValueError, match="resource"):
+            coordinator.interpret_state("")
+
+    def test_validates_null_bytes(self, coordinator: Coordinator) -> None:
+        with pytest.raises(ValueError, match="resource"):
+            coordinator.interpret_state("foo\x00bar")
+
+    def test_validates_dot_slash_only(self, coordinator: Coordinator) -> None:
+        with pytest.raises(ValueError, match="empty after normalization"):
+            coordinator.interpret_state("./")
+
 
 # ---------------------------------------------------------------------------
 # JSON serialisability
@@ -400,3 +417,267 @@ class TestBusyErrorInConflictRecovery:
         assert result["status"] == "error"
         assert "temporarily locked" in result["message"]
         json.dumps(result)  # must be JSON-serialisable
+
+
+# ---------------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------------
+
+
+class TestRegister:
+    def test_register_returns_agent_id(self, coordinator: Coordinator) -> None:
+        result = coordinator.register("test-agent")
+        assert result["status"] == "registered"
+        assert result["agent_id"].startswith("agent-")
+        assert len(result["agent_id"]) == 14  # "agent-" + 8 hex
+        assert result["name"] == "test-agent"
+
+    def test_register_with_model(self, coordinator: Coordinator) -> None:
+        result = coordinator.register("test-agent", model="claude-sonnet-4-6")
+        assert result["status"] == "registered"
+
+    def test_register_empty_name_raises(self, coordinator: Coordinator) -> None:
+        with pytest.raises(ValueError, match="name"):
+            coordinator.register("")
+
+    def test_register_whitespace_name_raises(self, coordinator: Coordinator) -> None:
+        with pytest.raises(ValueError, match="name"):
+            coordinator.register("   ")
+
+    def test_register_long_name_raises(self, coordinator: Coordinator) -> None:
+        with pytest.raises(ValueError, match="256"):
+            coordinator.register("x" * 257)
+
+    def test_is_registered(self, coordinator: Coordinator) -> None:
+        result = coordinator.register("test-agent")
+        assert coordinator.is_registered(result["agent_id"])
+
+    def test_is_not_registered(self, coordinator: Coordinator) -> None:
+        assert not coordinator.is_registered("agent-unknown")
+
+    def test_register_json_serialisable(self, coordinator: Coordinator) -> None:
+        result = coordinator.register("test-agent")
+        json.dumps(result)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Refresh agent
+# ---------------------------------------------------------------------------
+
+
+class TestRefreshAgent:
+    def test_refresh_updates_last_activity(
+        self, coordinator: Coordinator, store: StateStore
+    ) -> None:
+        result = coordinator.register("test-agent")
+        agent_id = result["agent_id"]
+        record_before = store.get("_agents", agent_id)
+        old_activity = record_before.value["last_activity"]
+
+        coordinator.refresh_agent(agent_id)
+
+        record_after = store.get("_agents", agent_id)
+        new_activity = record_after.value["last_activity"]
+        assert new_activity >= old_activity
+
+    def test_refresh_nonexistent_is_noop(self, coordinator: Coordinator) -> None:
+        # Must not raise
+        coordinator.refresh_agent("agent-nonexist")
+
+
+# ---------------------------------------------------------------------------
+# Release all
+# ---------------------------------------------------------------------------
+
+
+class TestReleaseAll:
+    def test_release_all_releases_claims(self, coordinator: Coordinator) -> None:
+        coordinator.claim("a.md", "agent-a")
+        coordinator.claim("b.md", "agent-a")
+        released = coordinator.release_all("agent-a")
+        assert set(released) == {"a.md", "b.md"}
+
+        assert coordinator.status("a.md")["status"] == "available"
+        assert coordinator.status("b.md")["status"] == "available"
+
+    def test_release_all_skips_other_agents(self, coordinator: Coordinator) -> None:
+        coordinator.claim("a.md", "agent-a")
+        coordinator.claim("b.md", "agent-b")
+        released = coordinator.release_all("agent-a")
+        assert released == ["a.md"]
+        assert coordinator.status("b.md")["status"] == "claimed"
+
+    def test_release_all_empty(self, coordinator: Coordinator) -> None:
+        released = coordinator.release_all("agent-a")
+        assert released == []
+
+
+# ---------------------------------------------------------------------------
+# Deactivate agent
+# ---------------------------------------------------------------------------
+
+
+class TestDeactivateAgent:
+    def test_deactivate_marks_inactive(
+        self, coordinator: Coordinator, store: StateStore
+    ) -> None:
+        result = coordinator.register("test-agent")
+        agent_id = result["agent_id"]
+        coordinator.deactivate_agent(agent_id)
+
+        record = store.get("_agents", agent_id)
+        assert record.value["status"] == "inactive"
+        assert "disconnected_at" in record.value
+
+    def test_deactivate_nonexistent_is_noop(self, coordinator: Coordinator) -> None:
+        coordinator.deactivate_agent("agent-nonexist")
+
+
+# ---------------------------------------------------------------------------
+# TTL / claim expiry
+# ---------------------------------------------------------------------------
+
+
+class TestClaimTTLInit:
+    def test_negative_ttl_raises(self, store: StateStore) -> None:
+        with pytest.raises(ValueError, match="claim_ttl must be >= 0"):
+            Coordinator(store, claim_ttl=-1.0)
+
+    def test_zero_ttl_allowed(self, store: StateStore) -> None:
+        coord = Coordinator(store, claim_ttl=0.0)
+        assert coord._claim_ttl == 0.0
+
+    def test_none_ttl_allowed(self, store: StateStore) -> None:
+        coord = Coordinator(store, claim_ttl=None)
+        assert coord._claim_ttl is None
+
+
+class TestClaimTTL:
+    def test_claim_active_within_ttl(self, ttl_coordinator: Coordinator) -> None:
+        """Claim is active when agent activity is within TTL."""
+        result = ttl_coordinator.register("test-agent")
+        agent_id = result["agent_id"]
+        ttl_coordinator.claim("f.md", agent_id)
+        state = ttl_coordinator.interpret_state("f.md")
+        assert state["state"] == "claimed"
+
+    def test_claim_expired_after_ttl(
+        self, ttl_coordinator: Coordinator, store: StateStore
+    ) -> None:
+        """Claim is expired when agent activity exceeds TTL."""
+        result = ttl_coordinator.register("test-agent")
+        agent_id = result["agent_id"]
+        ttl_coordinator.claim("f.md", agent_id)
+
+        # Backdate agent's last_activity past the TTL
+        agent_record = store.get("_agents", agent_id)
+        old_time = (datetime.now(UTC) - timedelta(seconds=120)).isoformat()
+        agent_record.value["last_activity"] = old_time
+        store.set(
+            "_agents",
+            agent_id,
+            agent_record.value,
+            updated_by=agent_id,
+            expected_version=agent_record.version,
+        )
+
+        state = ttl_coordinator.interpret_state("f.md")
+        assert state["state"] == "expired"
+
+    def test_expired_claim_can_be_taken(
+        self, ttl_coordinator: Coordinator, store: StateStore
+    ) -> None:
+        """Another agent can claim an expired resource."""
+        result = ttl_coordinator.register("agent-1")
+        agent1 = result["agent_id"]
+        ttl_coordinator.claim("f.md", agent1)
+
+        # Expire the claim
+        agent_record = store.get("_agents", agent1)
+        old_time = (datetime.now(UTC) - timedelta(seconds=120)).isoformat()
+        agent_record.value["last_activity"] = old_time
+        store.set(
+            "_agents",
+            agent1,
+            agent_record.value,
+            updated_by=agent1,
+            expected_version=agent_record.version,
+        )
+
+        result2 = ttl_coordinator.claim("f.md", "agent-2")
+        assert result2["status"] == "claimed"
+
+    def test_status_expired_shows_available(
+        self, ttl_coordinator: Coordinator, store: StateStore
+    ) -> None:
+        """Status reports expired claims as available."""
+        result = ttl_coordinator.register("test-agent")
+        agent_id = result["agent_id"]
+        ttl_coordinator.claim("f.md", agent_id)
+
+        # Expire the claim
+        agent_record = store.get("_agents", agent_id)
+        old_time = (datetime.now(UTC) - timedelta(seconds=120)).isoformat()
+        agent_record.value["last_activity"] = old_time
+        store.set(
+            "_agents",
+            agent_id,
+            agent_record.value,
+            updated_by=agent_id,
+            expected_version=agent_record.version,
+        )
+
+        status = ttl_coordinator.status("f.md")
+        assert status["status"] == "available"
+        assert "expired" in status.get("note", "")
+
+    def test_no_ttl_claims_never_expire(self, coordinator: Coordinator) -> None:
+        """Without TTL, claims never expire."""
+        coordinator.claim("f.md", "agent-a")
+        state = coordinator.interpret_state("f.md")
+        assert state["state"] == "claimed"
+
+    def test_is_claim_active_fallback_to_claimed_at(self, store: StateStore) -> None:
+        """Falls back to claimed_at when agent record is missing."""
+        coord = Coordinator(store, claim_ttl=60.0)
+        # Write a claim directly without registering the agent
+        old_time = (datetime.now(UTC) - timedelta(seconds=120)).isoformat()
+        claim_value = {
+            "status": "claimed",
+            "by": "ghost-agent",
+            "at": old_time,
+        }
+        assert not coord._is_claim_active(claim_value)
+
+    def test_is_claim_active_recent_claimed_at(self, store: StateStore) -> None:
+        """Falls back to claimed_at and returns True if recent."""
+        coord = Coordinator(store, claim_ttl=60.0)
+        recent_time = datetime.now(UTC).isoformat()
+        claim_value = {
+            "status": "claimed",
+            "by": "ghost-agent",
+            "at": recent_time,
+        }
+        assert coord._is_claim_active(claim_value)
+
+
+# ---------------------------------------------------------------------------
+# Status enrichment with agent info
+# ---------------------------------------------------------------------------
+
+
+class TestStatusEnrichment:
+    def test_status_includes_agent_metadata(self, coordinator: Coordinator) -> None:
+        result = coordinator.register("editor", model="claude-sonnet-4-6")
+        agent_id = result["agent_id"]
+        coordinator.claim("f.md", agent_id)
+        status = coordinator.status("f.md")
+        assert status["agent_name"] == "editor"
+        assert status["agent_model"] == "claude-sonnet-4-6"
+
+    def test_status_without_agent_record(self, coordinator: Coordinator) -> None:
+        """Claims by unregistered agents still return status."""
+        coordinator.claim("f.md", "manual-agent")
+        status = coordinator.status("f.md")
+        assert status["status"] == "claimed"
+        assert "agent_name" not in status

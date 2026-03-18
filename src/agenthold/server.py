@@ -4,11 +4,12 @@ Agenthold MCP server.
 Two tool modes:
 
   standard (default):
-    Four high-level tools for plug-and-play coordination:
-      agenthold_claim   : claim exclusive access to a resource
-      agenthold_release : release your claim when done
-      agenthold_status  : check if a resource is available
-      agenthold_wait    : wait for a resource to become available
+    Five high-level tools for plug-and-play coordination:
+      agenthold_register : register and receive a unique agent ID
+      agenthold_claim    : claim exclusive access to a resource
+      agenthold_release  : release your claim when done
+      agenthold_status   : check if a resource is available
+      agenthold_wait     : wait for a resource to become available
 
   advanced (--tools advanced):
     Eight low-level primitives for custom protocols:
@@ -22,8 +23,9 @@ Two tool modes:
       agenthold_watch           : wait for a key's version to change
 
 Usage:
-  agenthold --db ./state.db                 # standard mode (default)
-  agenthold --db ./state.db --tools advanced  # advanced mode
+  agenthold --db ./state.db                      # standard mode (default)
+  agenthold --db ./state.db --tools advanced     # advanced mode
+  agenthold --db ./state.db --claim-ttl 1800     # standard + 30 min TTL
 
 Add to your MCP client config:
   {
@@ -66,9 +68,12 @@ _RESOURCE_FIELD: dict[str, str] = {
         "Identifier for the resource, e.g. a filename like 'intro.md' or 'src/main.py'"
     ),
 }
-_AGENT_FIELD: dict[str, str] = {
+_AGENT_ID_FIELD: dict[str, str] = {
     "type": "string",
-    "description": ("Your agent identifier. Use a consistent name across all calls."),
+    "description": (
+        "Your agent ID, received from agenthold_register. "
+        "You must register before calling this tool."
+    ),
 }
 
 COORDINATION_INSTRUCTIONS = """\
@@ -77,8 +82,11 @@ prevents conflicts when multiple agents work in the same environment.
 
 RULES:
 
+0. FIRST, call agenthold_register with your name and model to receive \
+   a unique agent_id. Use this agent_id for all subsequent calls.
+
 1. BEFORE modifying any file or shared resource, call agenthold_claim \
-   with the resource path and your agent name. Do not proceed until \
+   with the resource path and your agent_id. Do not proceed until \
    the claim is granted.
 
 2. If agenthold_claim returns "busy", do NOT modify the resource. \
@@ -87,15 +95,47 @@ RULES:
 3. AFTER finishing modifications, call agenthold_release immediately.
 
 4. Use the filename as the resource identifier for files \
-   (e.g. "intro.md", "src/main.py").
-
-5. Use a consistent agent name across all your calls.\
+   (e.g. "intro.md", "src/main.py").\
 """
 
 
 def _standard_tools() -> list[Tool]:
-    """Return the four high-level coordination tools."""
+    """Return the five high-level coordination tools."""
     return [
+        Tool(
+            name="agenthold_register",
+            description=(
+                "Register yourself and receive a unique agent_id. "
+                "IMPORTANT: You MUST call this once before using any "
+                "other agenthold tool that requires an agent_id. "
+                "Pass your name (e.g. 'editor-agent') and optionally "
+                "the model you are running on (e.g. 'claude-sonnet-4-6'). "
+                "The returned agent_id is your identity for this session "
+                "— use it in all subsequent agenthold_claim and "
+                "agenthold_release calls. "
+                "Do not call this more than once per session."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": (
+                            "A short descriptive name for your agent, "
+                            "e.g. 'editor-agent' or 'review-bot'."
+                        ),
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": (
+                            "The model you are running on, "
+                            "e.g. 'claude-sonnet-4-6'. Optional."
+                        ),
+                    },
+                },
+                "required": ["name"],
+            },
+        ),
         Tool(
             name="agenthold_claim",
             description=(
@@ -104,9 +144,9 @@ def _standard_tools() -> list[Tool]:
                 "shared resource when other agents may be working in the "
                 "same environment. Do not proceed with modifications until "
                 "the claim is granted. "
+                "You must call agenthold_register first to get an agent_id. "
                 "Pass the filename as the resource identifier (e.g. "
-                '"intro.md", "src/main.py"). Use a consistent agent name '
-                "across all your calls. "
+                '"intro.md", "src/main.py"). '
                 "Possible responses: "
                 '"claimed": You now hold exclusive access. Proceed with '
                 "your edits, then call agenthold_release when done. "
@@ -122,9 +162,9 @@ def _standard_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "resource": _RESOURCE_FIELD,
-                    "agent": _AGENT_FIELD,
+                    "agent_id": _AGENT_ID_FIELD,
                 },
-                "required": ["resource", "agent"],
+                "required": ["resource", "agent_id"],
             },
         ),
         Tool(
@@ -152,9 +192,9 @@ def _standard_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "resource": _RESOURCE_FIELD,
-                    "agent": _AGENT_FIELD,
+                    "agent_id": _AGENT_ID_FIELD,
                 },
-                "required": ["resource", "agent"],
+                "required": ["resource", "agent_id"],
             },
         ),
         Tool(
@@ -544,10 +584,18 @@ def _advanced_tools() -> list[Tool]:
 def make_server(
     db_path: str | Path,
     tools_mode: str = "standard",
+    claim_ttl: float | None = None,
 ) -> Server:
     store = StateStore(db_path)
-    coordinator = Coordinator(store)
+    coordinator = Coordinator(store, claim_ttl=claim_ttl)
+    return _make_server_from_parts(store, coordinator, tools_mode)
 
+
+def _make_server_from_parts(
+    store: StateStore,
+    coordinator: Coordinator,
+    tools_mode: str = "standard",
+) -> Server:
     if tools_mode == "standard":
         server = Server("agenthold", instructions=COORDINATION_INSTRUCTIONS)
     else:
@@ -607,6 +655,12 @@ def _dispatch_standard(
             "message": "Database temporarily locked. Retry after a short delay.",
             "hint": "Retry after a short delay.",
         }
+    except ConflictError as e:
+        return {
+            "status": "error",
+            "message": f"Unexpected conflict: {e}",
+            "hint": "Retry the operation.",
+        }
     except ValueError as e:
         return {"status": "error", "message": str(e)}
 
@@ -617,17 +671,36 @@ def _dispatch_standard_tool(
     args: dict[str, Any],
 ) -> dict[str, Any]:
     """Route a standard-mode tool call to the coordinator."""
+    if name == "agenthold_register":
+        return coordinator.register(
+            name=args["name"],
+            model=args.get("model", ""),
+        )
+
     if name == "agenthold_claim":
-        return coordinator.claim(args["resource"], args["agent"])
+        agent_id = args["agent_id"]
+        if not coordinator.is_registered(agent_id):
+            return {
+                "status": "error",
+                "message": ("Unknown agent_id. Call agenthold_register first."),
+            }
+        coordinator.refresh_agent(agent_id)
+        return coordinator.claim(args["resource"], agent_id)
 
-    elif name == "agenthold_release":
-        return coordinator.release(args["resource"], args["agent"])
+    if name == "agenthold_release":
+        agent_id = args["agent_id"]
+        if not coordinator.is_registered(agent_id):
+            return {
+                "status": "error",
+                "message": ("Unknown agent_id. Call agenthold_register first."),
+            }
+        coordinator.refresh_agent(agent_id)
+        return coordinator.release(args["resource"], agent_id)
 
-    elif name == "agenthold_status":
+    if name == "agenthold_status":
         return coordinator.status(args["resource"])
 
-    else:
-        return {"status": "error", "message": f"Unknown tool: {name}"}
+    return {"status": "error", "message": f"Unknown tool: {name}"}
 
 
 async def _wait_standard(
@@ -668,7 +741,7 @@ async def _wait_standard(
             await asyncio.sleep(0.2)
             continue
 
-        if state["state"] in ("unclaimed", "free"):
+        if state["state"] in ("unclaimed", "free", "expired"):
             return {
                 "status": "available",
                 "resource": state["resource"],
@@ -967,12 +1040,35 @@ async def _watch(
 
 
 async def _run_server(  # pragma: no cover
-    db_path: str | Path, tools_mode: str = "standard"
+    db_path: str | Path,
+    tools_mode: str = "standard",
+    claim_ttl: float | None = None,
 ) -> None:
-    server = make_server(db_path, tools_mode=tools_mode)
+    store = StateStore(db_path)
+    coordinator = Coordinator(store, claim_ttl=claim_ttl)
+    server = _make_server_from_parts(store, coordinator, tools_mode=tools_mode)
     async with stdio_server() as (read_stream, write_stream):
         init_options = server.create_initialization_options()
-        await server.run(read_stream, write_stream, init_options)
+        try:
+            await server.run(read_stream, write_stream, init_options)
+        finally:
+            # Disconnect cleanup: release all claims held by agents
+            # registered on this process and mark them inactive.
+            if tools_mode == "standard":
+                _cleanup_agents(coordinator)
+
+
+def _cleanup_agents(  # pragma: no cover
+    coordinator: Coordinator,
+) -> None:
+    """Release claims and deactivate agents on disconnect.
+
+    Best-effort — failures are silently ignored since the process
+    is shutting down.
+    """
+    for agent_id in list(coordinator._registered_agents):
+        coordinator.release_all(agent_id)
+        coordinator.deactivate_agent(agent_id)
 
 
 def main() -> None:  # pragma: no cover
@@ -991,8 +1087,23 @@ def main() -> None:  # pragma: no cover
             "'advanced' (raw get/set/delete/watch/list/history/clear/export)"
         ),
     )
+    parser.add_argument(
+        "--claim-ttl",
+        type=float,
+        default=None,
+        help=(
+            "Seconds before an inactive agent's claims expire "
+            "(default: no expiry). Only applies in standard mode."
+        ),
+    )
     args = parser.parse_args()
-    asyncio.run(_run_server(args.db, tools_mode=args.tools))
+    asyncio.run(
+        _run_server(
+            args.db,
+            tools_mode=args.tools,
+            claim_ttl=args.claim_ttl,
+        )
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -64,7 +64,7 @@ pip install agenthold
 
 Agents automatically coordinate. No CLAUDE.md, no system prompt changes, no namespace design.
 
-When an agent connects, it sees four self-documenting tools: `agenthold_claim`, `agenthold_release`, `agenthold_status`, and `agenthold_wait`. The tool descriptions tell the agent when and how to use each one. Server instructions reinforce the protocol when the MCP client includes them.
+When an agent connects, it sees five self-documenting tools: `agenthold_register`, `agenthold_claim`, `agenthold_release`, `agenthold_status`, and `agenthold_wait`. The tool descriptions tell the agent when and how to use each one. Server instructions reinforce the protocol when the MCP client includes them.
 
 Works with Claude Desktop, Cursor, Continue, and any MCP-compatible client.
 
@@ -72,14 +72,33 @@ Works with Claude Desktop, Cursor, Continue, and any MCP-compatible client.
 
 ## Tools
 
-agenthold exposes four coordination tools by default.
+agenthold exposes five coordination tools by default.
+
+### `agenthold_register`
+
+Register yourself and receive a unique agent ID. Must be called once before using `agenthold_claim` or `agenthold_release`.
+
+```json
+{ "name": "editor-agent", "model": "claude-sonnet-4-6" }
+```
+
+```json
+{
+  "status": "registered",
+  "agent_id": "agent-a1b2c3d4",
+  "name": "editor-agent",
+  "registered_at": "2026-03-18T10:00:00+00:00"
+}
+```
+
+---
 
 ### `agenthold_claim`
 
-Claim exclusive access to a resource before modifying it.
+Claim exclusive access to a resource before modifying it. Requires a registered `agent_id`.
 
 ```json
-{ "resource": "intro.md", "agent": "writer-1" }
+{ "resource": "intro.md", "agent_id": "agent-a1b2c3d4" }
 ```
 
 **Claimed** — you hold exclusive access:
@@ -92,8 +111,8 @@ Claim exclusive access to a resource before modifying it.
 {
   "status": "busy",
   "resource": "intro.md",
-  "held_by": "writer-2",
-  "claimed_at": "2026-03-17T10:00:00+00:00",
+  "held_by": "agent-e5f6g7h8",
+  "claimed_at": "2026-03-18T10:00:00+00:00",
   "hint": "Another agent holds this resource. Work on a different resource, or call agenthold_wait to be notified when it becomes available."
 }
 ```
@@ -107,10 +126,10 @@ Claim exclusive access to a resource before modifying it.
 
 ### `agenthold_release`
 
-Release your claim after finishing edits. This immediately notifies any agents waiting via `agenthold_wait`.
+Release your claim after finishing edits. This immediately notifies any agents waiting via `agenthold_wait`. Requires a registered `agent_id`.
 
 ```json
-{ "resource": "intro.md", "agent": "writer-1" }
+{ "resource": "intro.md", "agent_id": "agent-a1b2c3d4" }
 ```
 
 ```json
@@ -121,7 +140,7 @@ Release your claim after finishing edits. This immediately notifies any agents w
 
 ### `agenthold_status`
 
-Check whether a resource is available or currently claimed.
+Check whether a resource is available or currently claimed. Does not require registration.
 
 ```json
 { "resource": "intro.md" }
@@ -137,8 +156,10 @@ Check whether a resource is available or currently claimed.
 {
   "status": "claimed",
   "resource": "intro.md",
-  "held_by": "writer-2",
-  "claimed_at": "2026-03-17T10:00:00+00:00",
+  "held_by": "agent-e5f6g7h8",
+  "agent_name": "editor-agent",
+  "agent_model": "claude-sonnet-4-6",
+  "claimed_at": "2026-03-18T10:00:00+00:00",
   "version": 3
 }
 ```
@@ -538,14 +559,16 @@ uv run python examples/budget_allocation/with_agenthold.py
 ## Configuration
 
 ```bash
-agenthold --db ./state.db                   # standard mode (default)
-agenthold --db ./state.db --tools advanced  # advanced mode
+agenthold --db ./state.db                      # standard mode (default)
+agenthold --db ./state.db --tools advanced     # advanced mode
+agenthold --db ./state.db --claim-ttl 1800     # standard + 30 min TTL
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `--db` | `./agenthold.db` | Path to the SQLite database file. Use `:memory:` for an in-process store (testing only; data is lost when the process exits). |
-| `--tools` | `standard` | Tool set: `standard` (claim/release/status/wait) or `advanced` (get/set/delete/watch/list/history/clear/export). |
+| `--tools` | `standard` | Tool set: `standard` (register/claim/release/status/wait) or `advanced` (get/set/delete/watch/list/history/clear/export). |
+| `--claim-ttl` | None (no expiry) | Seconds before an inactive agent's claims expire. Only applies in standard mode. When set, claims held by agents whose last activity exceeds this value are treated as expired and can be taken by other agents. |
 
 The database file is created automatically on first run. Back it up like any other SQLite file.
 

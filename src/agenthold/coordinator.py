@@ -5,15 +5,17 @@ Implements a resource claim lifecycle (unclaimed → claimed → free → claime
 using the generic get/set primitives with OCC. This is the only module that knows
 about claim semantics — the store layer remains generic.
 
-The four high-level operations:
-  claim   : acquire exclusive access to a resource
-  release : relinquish a claim after finishing work
-  status  : check whether a resource is available or held
-  wait    : (async, lives in server.py) poll until a resource becomes free
+The five high-level operations:
+  register : register an agent and receive a unique ID
+  claim    : acquire exclusive access to a resource
+  release  : relinquish a claim after finishing work
+  status   : check whether a resource is available or held
+  wait     : (async, lives in server.py) poll until a resource becomes free
 """
 
 import re
-from datetime import UTC, datetime
+import uuid
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from agenthold.exceptions import BusyError, ConflictError, NotFoundError
@@ -24,9 +26,18 @@ class Coordinator:
     """High-level claim coordination on top of StateStore."""
 
     NAMESPACE = "claims"
+    AGENTS_NAMESPACE = "_agents"
 
-    def __init__(self, store: StateStore) -> None:
+    def __init__(
+        self,
+        store: StateStore,
+        claim_ttl: float | None = None,
+    ) -> None:
+        if claim_ttl is not None and claim_ttl < 0:
+            raise ValueError("claim_ttl must be >= 0")
         self._store = store
+        self._claim_ttl = claim_ttl
+        self._registered_agents: set[str] = set()
 
     # ------------------------------------------------------------------
     # Helpers
@@ -64,6 +75,63 @@ class Coordinator:
         """Check whether a stored value is a well-formed claim dict."""
         return isinstance(value, dict) and "status" in value
 
+    def _is_claim_active(self, value: dict[str, Any]) -> bool:
+        """Check if the agent holding a claim is still active.
+
+        Returns True if:
+        - TTL is disabled (claim_ttl is None)
+        - The agent's last_activity is within the TTL window
+        - Falling back to claimed_at if agent record is missing
+
+        Returns False if the claim has expired.
+        """
+        if self._claim_ttl is None:
+            return True
+
+        agent_id = value.get("by")
+        if not agent_id:
+            return False
+
+        # Primary: check agent's last_activity
+        try:
+            agent_record = self._store.get(self.AGENTS_NAMESPACE, agent_id)
+            last_activity = agent_record.value.get("last_activity")
+            if last_activity:
+                deadline = datetime.fromisoformat(last_activity) + timedelta(
+                    seconds=self._claim_ttl
+                )
+                return deadline > datetime.now(UTC)
+        except (NotFoundError, BusyError):
+            pass
+        except (ValueError, TypeError, AttributeError):
+            pass
+
+        # Fallback: use claimed_at from the claim itself
+        claimed_at = value.get("at")
+        if claimed_at:
+            try:
+                deadline = datetime.fromisoformat(claimed_at) + timedelta(
+                    seconds=self._claim_ttl
+                )
+                return deadline > datetime.now(UTC)
+            except (ValueError, TypeError):
+                pass
+
+        return False  # Can't determine — treat as expired
+
+    def _get_agent_info(self, agent_id: str) -> dict[str, str] | None:
+        """Look up agent metadata from the _agents namespace."""
+        try:
+            record = self._store.get(self.AGENTS_NAMESPACE, agent_id)
+            if not isinstance(record.value, dict):
+                return None
+            return {
+                "agent_name": record.value.get("name", ""),
+                "agent_model": record.value.get("model", ""),
+            }
+        except (NotFoundError, BusyError):
+            return None
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -75,12 +143,11 @@ class Coordinator:
 
         Returns one of:
         - {"state": "unclaimed", "resource": <normalized>}
-        - {"state": "free", "resource": <normalized>,
-           "last_held_by": str, "released_at": str, "version": int}
-        - {"state": "claimed", "resource": <normalized>,
-           "held_by": str, "claimed_at": str, "version": int}
+        - {"state": "free", ...}
+        - {"state": "claimed", ...}
+        - {"state": "expired", ...}  (claimed but TTL elapsed)
         """
-        key = self._normalize_resource(resource)
+        key = self._validate_inputs(resource)
         try:
             record = self._store.get(self.NAMESPACE, key)
         except NotFoundError:
@@ -88,8 +155,6 @@ class Coordinator:
 
         value = record.value
         if not self._is_claim_value(value):
-            # Malformed value (e.g. from advanced-mode mixing) — treat
-            # as unclaimed so the next claim overwrites it.
             return {"state": "unclaimed", "resource": key}
 
         if value.get("status") == "free":
@@ -102,8 +167,16 @@ class Coordinator:
             }
 
         if value.get("status") == "claimed":
+            if self._is_claim_active(value):
+                return {
+                    "state": "claimed",
+                    "resource": key,
+                    "held_by": value.get("by", "unknown"),
+                    "claimed_at": value.get("at", "unknown"),
+                    "version": record.version,
+                }
             return {
-                "state": "claimed",
+                "state": "expired",
                 "resource": key,
                 "held_by": value.get("by", "unknown"),
                 "claimed_at": value.get("at", "unknown"),
@@ -149,6 +222,14 @@ class Coordinator:
                     "resource": key,
                     "version": record.version,
                 }
+            # Check if the claim has expired (TTL elapsed)
+            if not self._is_claim_active(value):
+                return self._attempt_claim(
+                    key,
+                    claim_value,
+                    agent,
+                    expected_version=record.version,
+                )
             return {
                 "status": "busy",
                 "resource": key,
@@ -259,14 +340,135 @@ class Coordinator:
                 "released_at": state["released_at"],
             }
 
-        # claimed
-        return {
+        if state["state"] == "expired":
+            return {
+                "status": "available",
+                "resource": key,
+                "note": (f"previous claim by {state['held_by']} expired"),
+            }
+
+        # claimed — enrich with agent metadata
+        result: dict[str, Any] = {
             "status": "claimed",
             "resource": key,
             "held_by": state["held_by"],
             "claimed_at": state["claimed_at"],
             "version": state["version"],
         }
+        info = self._get_agent_info(state["held_by"])
+        if info:
+            result["agent_name"] = info["agent_name"]
+            result["agent_model"] = info["agent_model"]
+        return result
+
+    def register(
+        self,
+        name: str,
+        model: str = "",
+        purpose: str = "",
+    ) -> dict[str, Any]:
+        """Register a new agent. Returns agent_id and metadata."""
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("name must not be empty")
+        if len(name) > 256:
+            raise ValueError("name must not exceed 256 characters")
+        agent_id = "agent-" + uuid.uuid4().hex[:8]
+        now = self._now()
+        value = {
+            "name": name,
+            "model": model,
+            "purpose": purpose,
+            "registered_at": now,
+            "last_activity": now,
+            "status": "active",
+        }
+        self._store.set(
+            self.AGENTS_NAMESPACE,
+            agent_id,
+            value,
+            updated_by=agent_id,
+            expected_version=0,
+        )
+        self._registered_agents.add(agent_id)
+        return {
+            "status": "registered",
+            "agent_id": agent_id,
+            "name": name,
+            "registered_at": now,
+        }
+
+    def is_registered(self, agent_id: str) -> bool:
+        """Check if an agent_id was registered on this coordinator."""
+        return agent_id in self._registered_agents
+
+    def refresh_agent(self, agent_id: str) -> None:
+        """Update last_activity for an agent. Best-effort."""
+        try:
+            record = self._store.get(self.AGENTS_NAMESPACE, agent_id)
+            value = dict(record.value)
+            value["last_activity"] = self._now()
+            self._store.set(
+                self.AGENTS_NAMESPACE,
+                agent_id,
+                value,
+                updated_by=agent_id,
+                expected_version=record.version,
+            )
+        except (NotFoundError, ConflictError, BusyError):
+            pass
+
+    def release_all(self, agent_id: str) -> list[str]:
+        """Release all claims held by an agent.
+
+        Best-effort: skips claims that can't be released due to
+        conflicts or DB locks. Returns list of released resources.
+        """
+        released: list[str] = []
+        try:
+            records = self._store.list_keys(self.NAMESPACE)
+        except BusyError:
+            return released
+        for record in records:
+            value = record.value
+            if (
+                isinstance(value, dict)
+                and value.get("by") == agent_id
+                and value.get("status") == "claimed"
+            ):
+                free_value = {
+                    "status": "free",
+                    "released_by": agent_id,
+                    "at": self._now(),
+                }
+                try:
+                    self._store.set(
+                        self.NAMESPACE,
+                        record.key,
+                        free_value,
+                        updated_by=agent_id,
+                        expected_version=record.version,
+                    )
+                    released.append(record.key)
+                except (ConflictError, BusyError):
+                    pass
+        return released
+
+    def deactivate_agent(self, agent_id: str) -> None:
+        """Mark an agent as inactive. Best-effort."""
+        try:
+            record = self._store.get(self.AGENTS_NAMESPACE, agent_id)
+            value = dict(record.value)
+            value["status"] = "inactive"
+            value["disconnected_at"] = self._now()
+            self._store.set(
+                self.AGENTS_NAMESPACE,
+                agent_id,
+                value,
+                updated_by=agent_id,
+                expected_version=record.version,
+            )
+        except (NotFoundError, ConflictError, BusyError):
+            pass
 
     # ------------------------------------------------------------------
     # Internal

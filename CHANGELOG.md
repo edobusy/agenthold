@@ -7,6 +7,45 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.4.0] - 2026-03-18
+
+### Breaking Changes
+- **`agenthold_claim`**: `agent` parameter renamed to `agent_id`. Agents must call
+  `agenthold_register` first to receive a server-issued unique ID.
+- **`agenthold_release`**: `agent` parameter renamed to `agent_id`. Same registration
+  requirement as `agenthold_claim`.
+- Standard mode now exposes **5 tools** (was 4). The new `agenthold_register` tool
+  must be called before `agenthold_claim` or `agenthold_release`.
+- `COORDINATION_INSTRUCTIONS` updated: rule 0 requires registration before any other
+  coordination call. Rule 5 (consistent agent name) removed — the server now manages
+  identity.
+
+### Added
+- **Agent registration** (`agenthold_register`): agents call this once per session to
+  receive a unique `agent-<8-hex>` ID. The server stores agent metadata (name, model,
+  registration time, last activity) in the `_agents` namespace.
+- **Registration enforcement**: `agenthold_claim` and `agenthold_release` reject calls
+  from unregistered agents with a structured error pointing to `agenthold_register`.
+- **Activity tracking**: every `agenthold_claim` and `agenthold_release` call updates
+  the agent's `last_activity` timestamp via `coordinator.refresh_agent()`.
+- **TTL-based claim expiry** (`--claim-ttl` CLI flag): when set, claims held by agents
+  whose `last_activity` exceeds the TTL are treated as expired. Expired claims can be
+  taken by other agents. Falls back to `claimed_at` if the agent record is missing.
+- **Disconnect cleanup**: on MCP stdio pipe close, the server releases all claims held
+  by agents registered on that process and marks them as inactive.
+- **Status enrichment**: `agenthold_status` now includes `agent_name` and `agent_model`
+  when the holding agent has a registration record.
+- **Expired state**: `interpret_state()` returns `"expired"` for claims past TTL;
+  `agenthold_status` reports these as `"available"` with a note; `agenthold_wait`
+  treats expired claims as available.
+- `Coordinator` gains `claim_ttl` parameter, `register()`, `is_registered()`,
+  `refresh_agent()`, `release_all()`, and `deactivate_agent()` methods.
+- `make_server()` gains `claim_ttl` parameter.
+- 25 new tests covering registration, TTL expiry, release_all, deactivate, status
+  enrichment, and dispatch-layer registration enforcement.
+
+---
+
 ## [0.3.0] - 2026-03-17
 
 ### Added
