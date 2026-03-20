@@ -7,6 +7,30 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.4.2] - 2026-03-20
+
+### Changed
+- **README overhaul**: rewrote opening with a stronger hook and "git for agents'
+  working memory" framing; added PyPI downloads, coverage, and Ruff badges; added
+  "Works with any agent framework" section covering LangChain, CrewAI, OpenAI Agents
+  SDK, AutoGen, Google ADK, and PydanticAI; added Mermaid architecture diagram; added
+  inline "What it looks like in practice" snippet; wrapped technical notes in a
+  collapsible section; reduced README from 626 to 423 lines
+- **Advanced tools extracted**: moved eight advanced tool docs to
+  `docs/advanced-tools.md` with a link from the README
+- **PyPI metadata enriched**: added `Development Status :: 4 - Beta`,
+  `Intended Audience :: Developers`, `Typing :: Typed`, and other classifiers;
+  added Changelog and Documentation URLs to `project.urls`
+
+### Added
+- `.github/ISSUE_TEMPLATE/bug_report.md`: structured bug report template
+- `.github/ISSUE_TEMPLATE/feature_request.md`: structured feature request template
+- `.github/ISSUE_TEMPLATE/config.yml`: allows blank issues alongside templates
+- `.github/pull_request_template.md`: PR template with all five quality gates as a
+  checklist
+
+---
+
 ## [0.4.1] - 2026-03-18
 
 ### Fixed
@@ -36,7 +60,7 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Standard mode now exposes **5 tools** (was 4). The new `agenthold_register` tool
   must be called before `agenthold_claim` or `agenthold_release`.
 - `COORDINATION_INSTRUCTIONS` updated: rule 0 requires registration before any other
-  coordination call. Rule 5 (consistent agent name) removed — the server now manages
+  coordination call. Rule 5 (consistent agent name) removed because the server now manages
   identity.
 
 ### Added
@@ -69,7 +93,7 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 - **Plug-and-play coordination layer**: four high-level tools that work out of the
-  box with zero configuration — no CLAUDE.md, no system prompt changes, no namespace
+  box with zero configuration: no CLAUDE.md, no system prompt changes, no namespace
   design required
   - `agenthold_claim`: claim exclusive access to a resource before modifying it
   - `agenthold_release`: release a claim when done, immediately notifying waiting agents
@@ -82,7 +106,7 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   to the same claim key (strips `./`, collapses slashes, normalizes backslashes)
 - **MCP server instructions**: `COORDINATION_INSTRUCTIONS` constant embedded in
   `server.py`, returned to every MCP client on connection as reinforcement. Tool
-  descriptions carry the protocol independently — if the client drops these
+  descriptions carry the protocol independently. If the client drops these
   instructions, the system still works.
 - `--tools` CLI flag: `standard` (default, 4 high-level tools) or `advanced` (8
   low-level primitives). The store layer is identical in both modes.
@@ -96,7 +120,7 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 - Default tool set is now `standard` (4 high-level tools). Use `--tools advanced`
   for the 8 low-level primitives from v0.2.0. No breaking changes to the primitive
-  tools — they are all still available in advanced mode.
+  tools; they are all still available in advanced mode.
 
 ---
 

@@ -1,11 +1,15 @@
 # agenthold
 
-> Shared versioned state for multi-agent AI workflows.
-> An MCP server that gives your agents a consistent, conflict-safe ground truth.
+**Stop your AI agents from silently overwriting each other.**
+
+When two agents update the same value, the second write quietly destroys the first. No error, no exception, just wrong data and a system that keeps running. agenthold is an MCP server that gives agents shared, versioned state with conflict detection built in. Think of it as `git` for your agents' working memory.
 
 [![CI](https://github.com/edobusy/agenthold/actions/workflows/ci.yml/badge.svg)](https://github.com/edobusy/agenthold/actions/workflows/ci.yml)
 [![PyPI version](https://img.shields.io/pypi/v/agenthold)](https://pypi.org/project/agenthold/)
+[![PyPI Downloads](https://static.pepy.tech/personalized-badge/agenthold?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/agenthold)
+[![Coverage 80%+](https://img.shields.io/badge/coverage-80%25%2B-brightgreen)](https://github.com/edobusy/agenthold/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/pypi/pyversions/agenthold)](https://pypi.org/project/agenthold/)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
@@ -14,11 +18,9 @@
 
 When two agents update the same value at the same time, the second write silently overwrites the first. No exception is raised. The value is wrong. The system keeps running.
 
-![Without Agenthold - the silent overcommit problem](assets/budget_without.gif)
+![Without agenthold: the silent overcommit problem](assets/budget_without.gif)
 
-In the example above, two agents both read a `$10,000` budget and each allocate from it independently. The total committed reaches `$15,000`. The budget dict never complains.
-
-This is not a race condition in the traditional sense. It is a **read-modify-write conflict**: each agent reads a value, does work, and writes back a result that assumes nothing changed in between. With multiple agents running concurrently, that assumption is always wrong.
+Two agents read a `$10,000` budget and allocate from it independently. Total committed: `$15,000`. The budget object never complains. This is a **read-modify-write conflict**: each agent's write assumes nothing changed since its read.
 
 ---
 
@@ -28,7 +30,7 @@ agenthold solves this with **optimistic concurrency control (OCC)**, the same me
 
 Every value stored in agenthold has a version number. When an agent writes, it passes the version it read. If the stored version has changed since the read, the write is **rejected** with a `ConflictError` that includes the current value. The agent re-reads, recalculates, and retries.
 
-![With Agenthold - conflict-safe allocation](assets/budget_with.gif)
+![With agenthold: conflict-safe allocation](assets/budget_with.gif)
 
 The losing agent detects the conflict, re-reads the real remaining budget (`$2,000`), and adjusts its allocation. The total committed is always exactly `$10,000`. Every write is tracked.
 
@@ -39,12 +41,56 @@ OCC is the right fit for agent workflows because:
 
 ---
 
+## Works with any agent framework
+
+agenthold connects via [MCP (Model Context Protocol)](https://modelcontextprotocol.io), the open standard for tool integration. Any framework that speaks MCP can use agenthold with zero glue code.
+
+| Framework | How to connect |
+|---|---|
+| **Claude Desktop / Claude Code** | Built-in: add to `mcpServers` config |
+| **Cursor / Continue / Windsurf** | Built-in: add to MCP config |
+| **LangChain / LangGraph** | [`langchain-mcp-adapters`](https://github.com/langchain-ai/langchain-mcp-adapters) |
+| **CrewAI** | Native `mcps` field on Agent |
+| **OpenAI Agents SDK** | Built-in `mcp_servers` param |
+| **Google ADK** | Built-in MCP Toolbox |
+| **AutoGen** | [`autogen_ext.tools.mcp`](https://microsoft.github.io/autogen/stable//user-guide/core-user-guide/components/workbench.html) |
+| **PydanticAI** | Native MCP integration |
+
+agenthold is not a framework. It is **shared infrastructure** that sits underneath your orchestration layer, the same way a database sits underneath your application. Your agents keep their existing tools and logic; agenthold adds the coordination primitive they are missing.
+
+> **Not using MCP yet?** agenthold also works as a [Python library](#use-as-a-python-library) you can call directly from any framework. Import `StateStore`, call `.get()` and `.set()` with version checks, and you have conflict-safe shared state.
+
+---
+
+## Architecture
+
+```mermaid
+graph LR
+    A1["Agent 1
+    LangChain, CrewAI, etc."] -->|MCP| S["agenthold
+    MCP Server"]
+    A2["Agent 2
+    Claude, OpenAI, etc."] -->|MCP| S
+    A3["Agent 3
+    AutoGen, ADK, etc."] -->|MCP| S
+    S --> DB[("SQLite
+    WAL mode")]
+    DB -->|version 3| S
+    S -->|"conflict! retry"| A2
+```
+
+Every write carries a version number. If the stored version has changed since an agent's read, the write is rejected and the agent retries with current data. This is the same mechanism used by Postgres conditional updates and DynamoDB conditional writes.
+
+---
+
 ## Quick start
 
 ### 1. Install
 
 ```bash
 pip install agenthold
+# or
+uv pip install agenthold
 ```
 
 ### 2. Add to your MCP client config
@@ -65,8 +111,6 @@ pip install agenthold
 Agents automatically coordinate. No CLAUDE.md, no system prompt changes, no namespace design.
 
 When an agent connects, it sees five self-documenting tools: `agenthold_register`, `agenthold_claim`, `agenthold_release`, `agenthold_status`, and `agenthold_wait`. The tool descriptions tell the agent when and how to use each one. Server instructions reinforce the protocol when the MCP client includes them.
-
-Works with Claude Desktop, Cursor, Continue, and any MCP-compatible client.
 
 ---
 
@@ -101,12 +145,12 @@ Claim exclusive access to a resource before modifying it. Requires a registered 
 { "resource": "intro.md", "agent_id": "agent-a1b2c3d4" }
 ```
 
-**Claimed** — you hold exclusive access:
+**Claimed** (you hold exclusive access):
 ```json
 { "status": "claimed", "resource": "intro.md", "version": 1 }
 ```
 
-**Busy** — another agent is working on this resource:
+**Busy** (another agent is working on this resource):
 ```json
 {
   "status": "busy",
@@ -117,7 +161,7 @@ Claim exclusive access to a resource before modifying it. Requires a registered 
 }
 ```
 
-**Already claimed** — you already hold this claim (idempotent):
+**Already claimed** (you already hold this claim, idempotent):
 ```json
 { "status": "already_claimed", "resource": "intro.md", "version": 1 }
 ```
@@ -174,7 +218,7 @@ Wait for a claimed resource to become available. Blocks the agent turn until the
 { "resource": "intro.md", "timeout_seconds": 30 }
 ```
 
-**Available** — resource was released:
+**Available** (resource was released):
 ```json
 { "status": "available", "resource": "intro.md", "elapsed_seconds": 2.4 }
 ```
@@ -192,273 +236,15 @@ Wait for a claimed resource to become available. Blocks the agent turn until the
 
 ---
 
-## Advanced usage
+## Advanced tools
 
-For power users building custom coordination protocols, agenthold exposes eight low-level primitives via `--tools advanced`:
+For custom coordination protocols, agenthold exposes eight low-level primitives via `--tools advanced`:
 
-```bash
-agenthold --db ./state.db --tools advanced
-```
+`agenthold_get` · `agenthold_set` · `agenthold_list` · `agenthold_history` · `agenthold_delete` · `agenthold_watch` · `agenthold_clear_namespace` · `agenthold_export`
 
-This gives agents direct access to `agenthold_get`, `agenthold_set`, `agenthold_list`, `agenthold_history`, `agenthold_delete`, `agenthold_clear_namespace`, `agenthold_export`, and `agenthold_watch`. No server instructions are sent in this mode.
+These give agents direct read/write/watch access to the versioned state store with full OCC conflict detection. No server instructions are sent in this mode.
 
-### `agenthold_get`
-
-Read the current value of a state record.
-
-```json
-{
-  "namespace": "order-1234",
-  "key": "status"
-}
-```
-
-```json
-{
-  "status": "ok",
-  "namespace": "order-1234",
-  "key": "status",
-  "value": "processing",
-  "version": 3,
-  "updated_by": "fulfillment-agent",
-  "updated_at": "2026-03-15T10:42:00.123456+00:00"
-}
-```
-
-Returns `{"status": "not_found"}` if the key does not exist. No exception is raised.
-
----
-
-### `agenthold_set`
-
-Write a value. `expected_version` is required — pass the version from a prior `agenthold_get`, or `0` for a key that should not yet exist.
-
-```json
-{
-  "namespace": "order-1234",
-  "key": "status",
-  "value": "shipped",
-  "updated_by": "logistics-agent",
-  "expected_version": 3
-}
-```
-
-**Success:**
-```json
-{
-  "status": "ok",
-  "namespace": "order-1234",
-  "key": "status",
-  "version": 4,
-  "previous_version": 3
-}
-```
-
-**Conflict** (another agent wrote before you):
-```json
-{
-  "status": "conflict",
-  "namespace": "order-1234",
-  "key": "status",
-  "expected_version": 3,
-  "actual_version": 5,
-  "actual_updated_by": "returns-agent",
-  "actual_updated_at": "2026-03-15T10:42:01.456+00:00",
-  "hint": "Call agenthold_get to read the current state, merge your changes, and retry with the new version."
-}
-```
-
-**`expected_version` patterns:**
-
-| Value | Behaviour |
-|---|---|
-| `0` | Create-only guard — succeeds only if the key does not yet exist; conflicts if it does |
-| `N` (from a prior `agenthold_get`) | Conflict-safe write — rejected if another agent wrote since your read |
-
-**`force` parameter:** Set `force: true` to write unconditionally, bypassing conflict detection. When `force` is true, `expected_version` is ignored. Use this only for idempotent writes or initial seeding where overwriting is intentional.
-
----
-
-### `agenthold_list`
-
-List all current state records in a namespace.
-
-```json
-{ "namespace": "order-1234" }
-```
-
-```json
-{
-  "status": "ok",
-  "namespace": "order-1234",
-  "count": 3,
-  "records": [
-    { "key": "reserved",  "value": true,        "version": 2, "updated_by": "inventory-agent", "updated_at": "..." },
-    { "key": "status",    "value": "processing", "version": 3, "updated_by": "fulfillment-agent", "updated_at": "..." },
-    { "key": "total",     "value": 80.99,        "version": 2, "updated_by": "pricing-agent",   "updated_at": "..." }
-  ]
-}
-```
-
----
-
-### `agenthold_history`
-
-Read the version history of a state record, newest first. Useful for debugging coordination issues and auditing writes.
-
-```json
-{
-  "namespace": "order-1234",
-  "key": "status",
-  "limit": 5
-}
-```
-
-```json
-{
-  "status": "ok",
-  "namespace": "order-1234",
-  "key": "status",
-  "history": [
-    { "version": 3, "value": "processing",  "updated_by": "fulfillment-agent", "updated_at": "...", "event_type": "write" },
-    { "version": 2, "value": "validated",   "updated_by": "validation-agent",  "updated_at": "...", "event_type": "write" },
-    { "version": 1, "value": "received",    "updated_by": "intake-agent",      "updated_at": "...", "event_type": "write" }
-  ]
-}
-```
-
-Each entry includes an `event_type` field: `"write"` for normal writes, `"delete"` for deletion events. Delete tombstones have `value: null`. An empty history list means no writes have been recorded for this key — the key may not exist. Use `agenthold_get` to check current state.
-
----
-
-### `agenthold_delete`
-
-Permanently remove a state record. The deletion is written as a tombstone in `agenthold_history` so the full lifecycle of the key remains auditable.
-
-```json
-{
-  "namespace": "order-1234",
-  "key": "status",
-  "deleted_by": "cleanup-agent",
-  "expected_version": 4
-}
-```
-
-**Success:**
-```json
-{
-  "status": "ok",
-  "namespace": "order-1234",
-  "key": "status",
-  "deleted_by": "cleanup-agent",
-  "deleted_version": 4
-}
-```
-
-`expected_version` is required — pass the version from a prior `agenthold_get` to prevent accidentally deleting a record that was updated since your read. Set `force: true` to delete unconditionally (bypasses conflict detection; `expected_version` is ignored).
-
----
-
-### `agenthold_export`
-
-Export all live records and their complete version history for a namespace as a single JSON snapshot. Intended for debugging coordination issues and building audit trails.
-
-```json
-{ "namespace": "order-1234" }
-```
-
-```json
-{
-  "status": "ok",
-  "namespace": "order-1234",
-  "exported_at": "2026-03-16T10:00:00.123456+00:00",
-  "record_count": 2,
-  "history_count": 5,
-  "records": [
-    {
-      "key": "status",
-      "value": "shipped",
-      "version": 3,
-      "updated_by": "logistics-agent",
-      "updated_at": "2026-03-16T09:59:00+00:00",
-      "history": [
-        {"version": 3, "value": "shipped",    "event_type": "write", "updated_by": "logistics-agent",   "updated_at": "..."},
-        {"version": 2, "value": "processing", "event_type": "write", "updated_by": "fulfillment-agent", "updated_at": "..."},
-        {"version": 1, "value": "received",   "event_type": "write", "updated_by": "intake-agent",      "updated_at": "..."}
-      ]
-    }
-  ]
-}
-```
-
-Records are sorted alphabetically by key. History entries are ordered newest first. `history_count` is the total across all keys and includes delete tombstones (which have `value: null`). Only live (non-deleted) keys are included; use `agenthold_history` to inspect deleted keys.
-
----
-
-### `agenthold_watch`
-
-Wait for a key's version to change, then return the new value. Polls every 200 ms.
-
-> **Important:** This call holds the agent turn until it returns. No other actions can be taken while waiting. Only use this when the agent has nothing else to do until the key changes.
-
-```json
-{
-  "namespace": "pipeline",
-  "key": "step_1_result",
-  "since_version": 0,
-  "timeout_seconds": 30
-}
-```
-
-**Changed — key updated within timeout:**
-```json
-{
-  "status": "ok",
-  "namespace": "pipeline",
-  "key": "step_1_result",
-  "value": {"score": 0.92},
-  "version": 1,
-  "updated_by": "agent-a",
-  "updated_at": "2026-03-16T10:00:01.123456+00:00"
-}
-```
-
-**Timeout — nothing changed:**
-```json
-{
-  "status": "timeout",
-  "namespace": "pipeline",
-  "key": "step_1_result",
-  "since_version": 0,
-  "elapsed_seconds": 30.001,
-  "hint": "The key did not change within the timeout. Retry with the same since_version, or call agenthold_get to check current state before deciding whether to wait again."
-}
-```
-
----
-
-### `agenthold_clear_namespace`
-
-Delete all state records in a namespace in a single atomic operation. A tombstone is written to `agenthold_history` for every key removed.
-
-```json
-{
-  "namespace": "order-1234",
-  "deleted_by": "cleanup-agent"
-}
-```
-
-```json
-{
-  "status": "ok",
-  "namespace": "order-1234",
-  "deleted_count": 3,
-  "deleted_keys": ["items", "status", "total"],
-  "deleted_by": "cleanup-agent"
-}
-```
-
-`deleted_keys` is sorted alphabetically. This operation has no conflict guard — it deletes unconditionally. If `deleted_keys` contains unexpected entries, use `agenthold_history` on those keys to investigate what was written and by whom.
+**[See the full advanced tools reference →](docs/advanced-tools.md)**
 
 ---
 
@@ -526,32 +312,42 @@ except ConflictError as e:
 
 ---
 
-## Examples
+## What it looks like in practice
+
+In a multi-agent session, the coordination is automatic. An agent's tool calls look like this:
+
+```
+Agent A: agenthold_register(name="writer", model="claude-sonnet-4-6")
+         → agent_id: "agent-a1b2c3d4"
+
+Agent A: agenthold_claim(resource="chapter-3.md", agent_id="agent-a1b2c3d4")
+         → status: "claimed"
+
+Agent B: agenthold_claim(resource="chapter-3.md", agent_id="agent-e5f6g7h8")
+         → status: "busy", hint: "Work on a different resource..."
+
+Agent A: agenthold_release(resource="chapter-3.md", agent_id="agent-a1b2c3d4")
+         → status: "released"
+```
+
+No system prompt engineering. The tool descriptions guide the agents.
+
+### Worked examples
 
 Two worked examples are included, each with a "before" and "after" script.
 
-### Order processing
-
-Two agents update the same order record concurrently: an inventory agent marks it reserved and sets the status, a pricing agent applies a discount.
+**Order processing**: two agents update the same order record concurrently:
 
 ```bash
-# The problem: one agent silently overwrites the other
-uv run python examples/order_processing/without_agenthold.py
-
-# The solution: conflict detection + retry
-uv run python examples/order_processing/with_agenthold.py
+uv run python examples/order_processing/without_agenthold.py   # silent overwrite
+uv run python examples/order_processing/with_agenthold.py      # conflict detection + retry
 ```
 
-### Budget allocation
-
-Two agents draw from a shared marketing budget. Without conflict detection, the budget is silently overcommitted. With agenthold, the losing agent re-reads the remaining balance and adjusts its allocation.
+**Budget allocation**: two agents draw from a shared marketing budget:
 
 ```bash
-# The problem: $10,000 budget committed to $15,000 of spend
-uv run python examples/budget_allocation/without_agenthold.py
-
-# The solution: exact allocation, full audit trail
-uv run python examples/budget_allocation/with_agenthold.py
+uv run python examples/budget_allocation/without_agenthold.py  # $10k budget → $15k committed
+uv run python examples/budget_allocation/with_agenthold.py     # exact allocation, full audit trail
 ```
 
 ---
@@ -599,13 +395,12 @@ uv run ruff format src/ tests/
 uv run mypy src/
 ```
 
-CI runs on Python 3.11 and 3.12 on every push to `main`.
+CI runs on Python 3.11 and 3.12 on every push to `main`. See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed guidelines.
 
 ---
 
-## Technical notes
-
-These notes are here for engineers who want to understand the design decisions.
+<details>
+<summary><strong>Technical notes</strong> (design decisions for engineers)</summary>
 
 **Why SQLite?**
 SQLite is the right tool for this scope. It is zero-dependency, ships in the Python stdlib, and runs everywhere. WAL mode is enabled so that read-only operations (exports, watches) do not block writers across processes. Write transactions use `BEGIN IMMEDIATE` to acquire the write lock upfront, ensuring OCC conflict detection works correctly even when multiple agenthold processes share the same database file. `busy_timeout` is set to 5 seconds so a second writer waits rather than failing immediately. Postgres adds an ops dependency with no benefit at this scale. The storage backend is behind a clean interface (`StateStore`) that can be swapped for Postgres when the need arises. Choosing a simple tool deliberately is not a limitation.
@@ -618,6 +413,8 @@ Each key has a version that starts at 1 and increments by exactly 1 on every wri
 
 **What would change for production scale:**
 Three things. First, replace SQLite with Postgres: better concurrent write throughput, replication, and managed hosting. The `StateStore` interface is already designed to make this a contained change. Second, add authentication: the current server trusts any caller on the stdio transport. A production deployment needs at minimum an API key check. Third, add the HTTP transport: the MCP SDK supports `StreamableHTTPServer`, which would let remote agents connect over the network instead of requiring a local process.
+
+</details>
 
 ---
 
