@@ -10,6 +10,7 @@ When two agents update the same value, the second write quietly destroys the fir
 [![Coverage 80%+](https://img.shields.io/badge/coverage-80%25%2B-brightgreen)](https://github.com/edobusy/agenthold/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/pypi/pyversions/agenthold)](https://pypi.org/project/agenthold/)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![Glama score](https://glama.ai/mcp/servers/edobusy/agenthold/badges/score.svg)](https://glama.ai/mcp/servers/edobusy/agenthold)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
