@@ -1,4 +1,4 @@
-name: Publish to PyPI
+name: Publish to PyPI and MCP Registry
 
 on:
   push:
@@ -11,14 +11,62 @@ jobs:
     environment: pypi
     permissions:
       id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
       - name: Install uv
         uses: astral-sh/setup-uv@v3
 
+      - name: Verify tag matches pyproject.toml and server.json versions
+        run: |
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          PYPROJECT_VERSION=$(grep -E '^version\s*=' pyproject.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          SERVER_JSON_TOP_VERSION=$(python -c "import json; print(json.load(open('server.json'))['version'])")
+          SERVER_JSON_PKG_VERSION=$(python -c "import json; print(json.load(open('server.json'))['packages'][0]['version'])")
+          echo "tag=$TAG_VERSION pyproject=$PYPROJECT_VERSION server.json(top)=$SERVER_JSON_TOP_VERSION server.json(pkg)=$SERVER_JSON_PKG_VERSION"
+          if [ "$TAG_VERSION" != "$PYPROJECT_VERSION" ] \
+             || [ "$TAG_VERSION" != "$SERVER_JSON_TOP_VERSION" ] \
+             || [ "$TAG_VERSION" != "$SERVER_JSON_PKG_VERSION" ]; then
+            echo "::error::Version mismatch. All four (tag, pyproject.toml, server.json top-level version, server.json packages[0].version) must match."
+            exit 1
+          fi
+
+      - name: Validate server.json against MCP schema
+        run: |
+          pip install --quiet check-jsonschema
+          check-jsonschema \
+            --schemafile https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json \
+            server.json
+
       - name: Build distribution
         run: uv build
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: Wait for PyPI to index the new release
+        run: |
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -sSf "https://pypi.org/pypi/agenthold/${TAG_VERSION}/json" > /dev/null; then
+              echo "agenthold ${TAG_VERSION} is live on PyPI"
+              exit 0
+            fi
+            echo "Attempt $i: not yet indexed, sleeping 15s..."
+            sleep 15
+          done
+          echo "::error::PyPI did not index ${TAG_VERSION} within 150s"
+          exit 1
+
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/download/v1.5.0/mcp-publisher_linux_amd64.tar.gz" \
+            | tar -xz mcp-publisher
+          chmod +x mcp-publisher
+
+      - name: Authenticate to MCP Registry (GitHub OIDC)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish to MCP Registry
+        run: ./mcp-publisher publish

@@ -1,3 +1,7 @@
+# MCP registry publisher credential caches
+.mcpregistry_github_token
+.mcpregistry_registry_token
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

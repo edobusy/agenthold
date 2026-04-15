@@ -421,3 +421,8 @@ Three things. First, replace SQLite with Postgres: better concurrent write throu
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+---
+
+mcp-name: io.github.edobusy/agenthold
+

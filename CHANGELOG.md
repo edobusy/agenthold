@@ -7,6 +7,21 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.4.3] - 2026-04-15
+
+### Added
+- **MCP Registry publishing**: added `server.json` at the repo root describing the
+  PyPI-distributed stdio server, with light/dark icons, `--tools` and `--db`
+  argument hints, and schema-validated metadata for the
+  `io.github.edobusy/agenthold` namespace.
+- README now carries the `mcp-name:` ownership marker required by the official
+  MCP registry to bind the PyPI package to this namespace.
+- GitHub Actions `publish.yml` extended to auto-publish to the MCP registry
+  (via GitHub OIDC) immediately after each successful PyPI release, with a
+  pre-flight version-sync check and schema validation.
+
+---
+
 ## [0.4.2] - 2026-03-20
 
 ### Changed
