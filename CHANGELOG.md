@@ -7,6 +7,77 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.5.0] - 2026-05-08
+
+### Breaking Changes
+- **Resource identification overhaul**: standard-mode tools now require
+  resources to be passed as canonical strings, parsed against a configured
+  workspace registry. Two forms are accepted: workspace-relative bare paths
+  (e.g. `"src/main.py"`) and explicit URIs (e.g. `"file://myproj/src/main.py"`
+  or `"custom://task-42"`). Bare paths resolve to the workspace named
+  `default`, or the only configured workspace if exactly one exists.
+  Equivalent inputs (`"src/main.py"`, `"./src/main.py"`, `"src\\main.py"`,
+  `"src//main.py"`, an absolute path inside the workspace) all canonicalize
+  to the same internal URI. Path traversal (`..`) and dot segments (`.`)
+  are rejected at the boundary.
+- **`agenthold_release` now takes an explicit `outcome`**: agents declare
+  what they did to the resource — `released` (default), `modified`,
+  `created`, `deleted`, or `moved`. For `moved`, a `moved_to` field is
+  required. The outcome is preserved in the free-state record and surfaced
+  on subsequent `agenthold_claim`, `agenthold_wait`, and `agenthold_status`
+  responses as `previous_outcome`, so the next claimant can reason about
+  what the previous holder did.
+- **`Coordinator` constructor**: now requires a `WorkspaceRegistry` as its
+  second argument.
+- **`make_server` / `_run_server`**: now take a `workspaces: list[Workspace]`
+  parameter (defaults to a single `default` workspace at the current working
+  directory if not provided).
+
+### Added
+- **`--workspace name=path` CLI flag** (repeatable): configures a workspace
+  for resource identification. Path-only form (e.g. `--workspace /abs/path`)
+  derives the name from the path's basename. If omitted, a single workspace
+  named `default` is created at the current working directory.
+- **Server-set outcomes for involuntary release**:
+  - `abandoned`: written by `release_all` during disconnect cleanup, telling
+    the next claimant the holder did not get to declare an outcome.
+  - `expired`: synthesized at TTL takeover and surfaced in
+    `previous_outcome` so the next claimant knows the resource was reclaimed
+    from an inactive holder.
+- **Lifecycle hints**: `agenthold_claim` / `agenthold_wait` / `agenthold_status`
+  responses include a `hint` string when the previous outcome was non-trivial
+  (`deleted`, `moved`, `abandoned`, `expired`), nudging the agent toward the
+  right next action.
+- **Multi-workspace support**: same path under different workspaces is
+  isolated. Cross-workspace moves are honest — `moved_to` may carry a URI
+  in any configured workspace.
+- New `agenthold.resources` module exposing `Workspace`, `WorkspaceRegistry`,
+  `ResourceId`, `parse_resource_input`.
+- 68 new tests in `tests/test_resources.py` covering workspace validation,
+  URI parsing, bare-path canonicalization, longest-prefix matching, and
+  rejection of path traversal / dot segments / oversize input.
+- New tests in `test_coordinator.py` and `test_server_standard.py` covering
+  outcomes, previous_outcome propagation, abandoned/expired surfacing,
+  rename flows, and multi-workspace isolation.
+
+### Changed
+- **`COORDINATION_INSTRUCTIONS` is now dynamic**: the rendered instruction
+  text includes the configured workspaces and identifies which one is the
+  default for bare paths. The module-level `COORDINATION_INSTRUCTIONS`
+  constant remains for back-compat (renders with no workspace block); use
+  `coordination_instructions(registry)` to get the up-to-date version.
+- Tool descriptions for `agenthold_claim`, `agenthold_release`,
+  `agenthold_status`, `agenthold_wait` updated to document the new resource
+  string format and outcome semantics.
+- The `claims` namespace now stores entries keyed by canonical URI (e.g.
+  `file://default/src/main.py`) instead of an ad-hoc normalized path. Old
+  databases will work but their existing claim records will be unreachable
+  through the new API; wipe and recreate the DB on upgrade.
+- `Coordinator._normalize_resource` removed (replaced by
+  `agenthold.resources.parse_resource_input`).
+
+---
+
 ## [0.4.3] - 2026-04-15
 
 ### Added
