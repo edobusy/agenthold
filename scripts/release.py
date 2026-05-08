@@ -355,10 +355,11 @@ def main() -> int:  # pragma: no cover
         print(f"(dry-run) would create annotated tag v{new_version}")
     else:
         _run(["git", "diff", "--stat", "--", *files])
-        if not _confirm(f"Commit as 'release: v{new_version}'?", default=True):
+        commit_message = f"chore: bump version to {new_version} for PyPI release"
+        if not _confirm(f"Commit as {commit_message!r}?", default=True):
             return 1
         _run(["git", "add", "--", *files])
-        _run(["git", "commit", "-m", f"release: v{new_version}"])
+        _run(["git", "commit", "-m", commit_message])
         tag_msg = extract_changelog_section(
             CHANGELOG.read_text(encoding="utf-8"), new_version
         )
