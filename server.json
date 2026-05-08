@@ -3,7 +3,7 @@
   "name": "io.github.edobusy/agenthold",
   "title": "agenthold",
   "description": "Shared versioned state for multi-agent AI workflows",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "repository": {
     "url": "https://github.com/edobusy/agenthold",
     "source": "github"
@@ -28,7 +28,7 @@
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "agenthold",
-      "version": "0.5.0",
+      "version": "0.5.1",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"

@@ -7,6 +7,21 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.5.1] - 2026-05-08
+
+### Fixed
+- **Publish workflow OIDC audience compatibility**: bumped the `mcp-publisher`
+  install URL in `.github/workflows/publish.yml` from the pinned `v1.5.0` to
+  `releases/latest`. The MCP Registry tightened OIDC validation in registry
+  PR #1229 (merged 2026-04-30) to bind the token audience to the deployment
+  URL; older `mcp-publisher` binaries send the legacy hardcoded audience and
+  fail with `invalid audience` errors. v0.5.0 published to PyPI successfully
+  but required a manual local republish to land on the MCP Registry. v0.5.1
+  contains no functional changes — it exists so a clean release tag exercises
+  the patched workflow end-to-end.
+
+---
+
 ## [0.5.0] - 2026-05-08
 
 ### Breaking Changes
