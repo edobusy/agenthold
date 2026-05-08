@@ -7,7 +7,7 @@ Two tool modes:
     Five high-level tools for plug-and-play coordination:
       agenthold_register : register and receive a unique agent ID
       agenthold_claim    : claim exclusive access to a resource
-      agenthold_release  : release your claim when done
+      agenthold_release  : release your claim with an explicit outcome
       agenthold_status   : check if a resource is available
       agenthold_wait     : wait for a resource to become available
 
@@ -22,25 +22,27 @@ Two tool modes:
       agenthold_export          : export all records and full history
       agenthold_watch           : wait for a key's version to change
 
-Usage:
-  agenthold --db ./state.db                      # standard mode (default)
-  agenthold --db ./state.db --tools advanced     # advanced mode
-  agenthold --db ./state.db --claim-ttl 1800     # standard + 30 min TTL
+Resource identification (standard mode):
+  Resources are identified by a single ``resource`` string in either:
+    - URI form: 'file://<workspace>/<path>' or 'custom://<name>'
+    - Bare path: 'src/main.py' (resolved against the 'default' workspace,
+      or the only workspace if exactly one is configured)
+  Configured workspaces come from --workspace flags.
 
-Add to your MCP client config:
-  {
-    "mcpServers": {
-      "agenthold": {
-        "command": "agenthold",
-        "args": ["--db", "/path/to/state.db"]
-      }
-    }
-  }
+Usage:
+  agenthold --db ./state.db                        # default workspace = CWD
+  agenthold --workspace myproj=/abs/path           # named workspace
+  agenthold --workspace a=/x --workspace b=/y      # multiple workspaces
+  agenthold --tools advanced                       # advanced mode
+  agenthold --claim-ttl 1800                       # standard + 30 min TTL
 """
+
+from __future__ import annotations
 
 import argparse
 import asyncio
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -51,24 +53,31 @@ from mcp.types import TextContent, Tool
 
 from agenthold.coordinator import Coordinator
 from agenthold.exceptions import BusyError, ConflictError, NotFoundError
+from agenthold.resources import (
+    DEFAULT_WORKSPACE_NAME,
+    Workspace,
+    WorkspaceRegistry,
+)
 from agenthold.store import StateStore, _validate_identifier
 
-_NS_FIELD: dict[str, str] = {
-    "type": "string",
-    "description": "Workflow or resource identifier, e.g. 'order-1234'",
-}
-_KEY_FIELD: dict[str, str] = {
-    "type": "string",
-    "description": "The state key, e.g. 'status'",
-}
+# ---------------------------------------------------------------------------
+# Tool input field schemas
+# ---------------------------------------------------------------------------
 
-_RESOURCE_FIELD: dict[str, str] = {
+# Standard-mode resource string field (claim/release/status/wait input)
+_RESOURCE_FIELD: dict[str, Any] = {
     "type": "string",
     "description": (
-        "Identifier for the resource, e.g. a filename like 'intro.md' or 'src/main.py'"
+        "The resource identifier. Either a workspace-relative path "
+        "(e.g. 'src/main.py'), or a URI of the form "
+        "'file://<workspace>/<path>' or 'custom://<name>'. Bare paths "
+        "resolve against the workspace named 'default'; if no 'default' "
+        "exists, the only configured workspace is used; otherwise pass a "
+        "URI. Forward slashes only. No '..' segments."
     ),
 }
-_AGENT_ID_FIELD: dict[str, str] = {
+
+_AGENT_ID_FIELD: dict[str, Any] = {
     "type": "string",
     "description": (
         "Your agent ID, received from agenthold_register. "
@@ -76,29 +85,115 @@ _AGENT_ID_FIELD: dict[str, str] = {
     ),
 }
 
-COORDINATION_INSTRUCTIONS = """\
+_OUTCOME_FIELD: dict[str, Any] = {
+    "type": "string",
+    "enum": ["released", "modified", "created", "deleted", "moved"],
+    "default": "released",
+    "description": (
+        "What you did to the resource while holding the claim. "
+        "'released' (default) means no lifecycle change. 'modified' means "
+        "you changed it in place. 'created' means it didn't exist before. "
+        "'deleted' means it no longer exists at this resource. 'moved' "
+        "means you moved it — also pass moved_to with the new resource. "
+        "The outcome is preserved and shown to the next claimant so they "
+        "don't act on stale assumptions."
+    ),
+}
+
+_MOVED_TO_FIELD: dict[str, Any] = {
+    "type": "string",
+    "description": (
+        "Required when outcome='moved'. The resource string for the new "
+        "location, in the same form as 'resource'. Cross-workspace moves "
+        "are allowed: e.g. moved_to='file://other-workspace/path'."
+    ),
+}
+
+# Advanced-mode (existing) field constants
+_NS_FIELD: dict[str, Any] = {
+    "type": "string",
+    "description": "Workflow or resource identifier, e.g. 'order-1234'",
+}
+_KEY_FIELD: dict[str, Any] = {
+    "type": "string",
+    "description": "The state key, e.g. 'status'",
+}
+
+
+# ---------------------------------------------------------------------------
+# Coordination instructions (standard mode only)
+# ---------------------------------------------------------------------------
+
+_INSTRUCTIONS_TEMPLATE = """\
 You have access to agenthold, a resource coordination system that \
 prevents conflicts when multiple agents work in the same environment.
 
+Resources are identified by either:
+  - A workspace-relative path, e.g. "src/main.py" (uses the 'default' \
+workspace).
+  - A URI, e.g. "file://<workspace>/<path>" for files, or \
+"custom://<name>" for opaque names.
+{workspace_section}
 RULES:
 
 0. FIRST, call agenthold_register with your name and model to receive \
-   a unique agent_id. Use this agent_id for all subsequent calls.
+a unique agent_id. Use this agent_id for all subsequent calls.
 
 1. BEFORE modifying any file or shared resource, call agenthold_claim \
-   with the resource path and your agent_id. Do not proceed until \
-   the claim is granted. Claim each resource right before you modify \
-   it — do not claim multiple resources in advance.
+with the resource and your agent_id. Do not proceed until the claim is \
+granted. Claim each resource right before you modify it — do not claim \
+multiple resources in advance.
 
 2. If agenthold_claim returns "busy", do NOT modify the resource. \
-   Choose a different resource, or call agenthold_wait.
+Choose a different resource, or call agenthold_wait.
 
-3. AFTER finishing modifications, call agenthold_release immediately. \
-   Release before claiming your next resource.
+3. AFTER finishing modifications, call agenthold_release with an \
+explicit `outcome`:
+   - "released" (default): no lifecycle change to declare
+   - "modified": you modified the resource in place
+   - "created": you created the resource (didn't exist before)
+   - "deleted": you deleted the resource at this location
+   - "moved": you moved it elsewhere — also pass `moved_to` with the new \
+resource
 
-4. Use the filename as the resource identifier for files \
-   (e.g. "intro.md", "src/main.py").\
+4. For renames (mv old new): claim BOTH old and new, do the rename, \
+then release old with outcome="moved" and moved_to="new", and release \
+new with outcome="created".
+
+5. When a claim response includes `previous_outcome`, the previous \
+holder did something significant (deleted, moved, abandoned, expired). \
+Read the `hint` to decide how to proceed.\
 """
+
+
+def _format_workspace_section(registry: WorkspaceRegistry) -> str:
+    """Render the configured-workspaces block for the instructions."""
+    workspaces = registry.workspaces
+    if not workspaces:
+        return ""
+    bare_default = registry.default_for_bare_paths()
+    bare_default_name = bare_default.name if bare_default is not None else None
+    lines = ["", "Configured workspaces:"]
+    for ws in workspaces:
+        marker = " (default for bare paths)" if ws.name == bare_default_name else ""
+        lines.append(f"  - {ws.name}: {ws.root}{marker}")
+    return "\n".join(lines) + "\n"
+
+
+def coordination_instructions(registry: WorkspaceRegistry) -> str:
+    return _INSTRUCTIONS_TEMPLATE.format(
+        workspace_section=_format_workspace_section(registry)
+    )
+
+
+# Kept for backward-compatibility with anyone importing the constant; will
+# render with no workspaces, which is fine for that usage.
+COORDINATION_INSTRUCTIONS = _INSTRUCTIONS_TEMPLATE.format(workspace_section="")
+
+
+# ---------------------------------------------------------------------------
+# Tool definitions
+# ---------------------------------------------------------------------------
 
 
 def _standard_tools() -> list[Tool]:
@@ -150,18 +245,18 @@ def _standard_tools() -> list[Tool]:
                 "claim multiple resources in advance. Finish editing and "
                 "release one resource before claiming the next. "
                 "You must call agenthold_register first to get an agent_id. "
-                "Pass the filename as the resource identifier (e.g. "
-                '"intro.md", "src/main.py"). '
+                "Pass the resource string (e.g. 'src/main.py' or "
+                "'file://myproj/src/main.py'). "
                 "Possible responses: "
-                '"claimed": You now hold exclusive access. Proceed with '
-                "your edits, then call agenthold_release when done. "
+                '"claimed": You now hold exclusive access. The response '
+                "may include `previous_outcome` if the resource has prior "
+                "history (e.g. 'deleted', 'moved', 'abandoned', 'expired'); "
+                "read the `hint` to decide how to proceed. "
                 '"already_claimed": You already hold this claim. Safe to '
                 "proceed. "
                 '"busy": Another agent is working on this resource. Do NOT '
                 "modify it. Work on a different resource, or call "
-                "agenthold_wait to be notified when it becomes available. "
-                "The response includes who holds the claim and when they "
-                "claimed it."
+                "agenthold_wait to be notified when it becomes available."
             ),
             inputSchema={
                 "type": "object",
@@ -177,15 +272,20 @@ def _standard_tools() -> list[Tool]:
             description=(
                 "Release your exclusive claim on a resource after finishing "
                 "your edits. "
-                "IMPORTANT: You MUST call this when done modifying a "
-                "resource. Holding claims longer than necessary blocks "
-                "other agents. If you claimed a resource but decided not "
-                "to modify it, release it anyway. "
-                "The release immediately notifies any agents waiting via "
-                "agenthold_wait. "
+                "IMPORTANT: Always pass an explicit `outcome` describing "
+                "what you did: 'released' (default) for no change, "
+                "'modified' for in-place edits, 'created' for new "
+                "resources, 'deleted' for removed resources, or 'moved' "
+                "for renames (with `moved_to` set to the new resource). "
+                "The outcome is preserved and shown to the next claimant "
+                "so they don't act on stale assumptions. "
+                "For renames (mv old new), claim BOTH paths first, do the "
+                "rename, then release old with outcome='moved' and "
+                "moved_to='new', and release new with outcome='created'. "
                 "Possible responses: "
-                '"released": Claim released successfully. Other agents can '
-                "now claim the resource. "
+                '"released": Claim released. Other agents can now claim '
+                "the resource. The response echoes the outcome and any "
+                "moved_to. "
                 '"already_free": The resource was already free. No action '
                 "needed. "
                 '"not_found": The resource was never claimed. No action '
@@ -198,6 +298,8 @@ def _standard_tools() -> list[Tool]:
                 "properties": {
                     "resource": _RESOURCE_FIELD,
                     "agent_id": _AGENT_ID_FIELD,
+                    "outcome": _OUTCOME_FIELD,
+                    "moved_to": _MOVED_TO_FIELD,
                 },
                 "required": ["resource", "agent_id"],
             },
@@ -213,10 +315,12 @@ def _standard_tools() -> list[Tool]:
                 "claimed by another agent, work on a different resource or "
                 "call agenthold_wait. "
                 "Possible responses: "
-                '"available": The resource is free. Call agenthold_claim to '
-                "secure it before editing. "
-                '"claimed": Another agent holds this resource. The response '
-                "tells you who and when."
+                '"available": The resource is free. The response may '
+                "include `previous_outcome` and a `hint` if the previous "
+                "holder did something significant (deleted, moved, etc.). "
+                "Call agenthold_claim to secure it before editing. "
+                '"claimed": Another agent holds this resource. The '
+                "response tells you who and when."
             ),
             inputSchema={
                 "type": "object",
@@ -239,7 +343,9 @@ def _standard_tools() -> list[Tool]:
                 "Pass a reasonable timeout (default 30 seconds). On "
                 "timeout, the hint field suggests next steps. "
                 "Possible responses: "
-                '"available": The resource is now free. Call '
+                '"available": The resource is now free. The response may '
+                "include `previous_outcome` describing what the previous "
+                "holder did (e.g. 'moved' with moved_to). Call "
                 "agenthold_claim immediately to secure it — another agent "
                 "may also be waiting. "
                 '"timeout": The resource was not released within the '
@@ -586,23 +692,36 @@ def _advanced_tools() -> list[Tool]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# Server construction
+# ---------------------------------------------------------------------------
+
+
 def make_server(
     db_path: str | Path,
+    workspaces: list[Workspace] | None = None,
     tools_mode: str = "standard",
     claim_ttl: float | None = None,
 ) -> Server:
+    if workspaces is None:
+        workspaces = [Workspace(name=DEFAULT_WORKSPACE_NAME, root=os.getcwd())]
+    registry = WorkspaceRegistry(workspaces)
     store = StateStore(db_path)
-    coordinator = Coordinator(store, claim_ttl=claim_ttl)
-    return _make_server_from_parts(store, coordinator, tools_mode)
+    coordinator = Coordinator(store, registry, claim_ttl=claim_ttl)
+    return _make_server_from_parts(store, coordinator, registry, tools_mode)
 
 
 def _make_server_from_parts(
     store: StateStore,
     coordinator: Coordinator,
+    registry: WorkspaceRegistry,
     tools_mode: str = "standard",
 ) -> Server:
     if tools_mode == "standard":
-        server = Server("agenthold", instructions=COORDINATION_INSTRUCTIONS)
+        server = Server(
+            "agenthold",
+            instructions=coordination_instructions(registry),
+        )
     else:
         server = Server("agenthold")
 
@@ -641,9 +760,9 @@ def _make_server_from_parts(
     return server
 
 
-# -----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Standard mode dispatch (claim / release / status)
-# -----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 
 def _dispatch_standard(
@@ -687,7 +806,7 @@ def _dispatch_standard_tool(
         if not coordinator.is_registered(agent_id):
             return {
                 "status": "error",
-                "message": ("Unknown agent_id. Call agenthold_register first."),
+                "message": "Unknown agent_id. Call agenthold_register first.",
             }
         coordinator.refresh_agent(agent_id)
         return coordinator.claim(args["resource"], agent_id)
@@ -697,10 +816,15 @@ def _dispatch_standard_tool(
         if not coordinator.is_registered(agent_id):
             return {
                 "status": "error",
-                "message": ("Unknown agent_id. Call agenthold_register first."),
+                "message": "Unknown agent_id. Call agenthold_register first.",
             }
         coordinator.refresh_agent(agent_id)
-        return coordinator.release(args["resource"], agent_id)
+        return coordinator.release(
+            args["resource"],
+            agent_id,
+            outcome=args.get("outcome", "released"),
+            moved_to=args.get("moved_to"),
+        )
 
     if name == "agenthold_status":
         return coordinator.status(args["resource"])
@@ -710,33 +834,30 @@ def _dispatch_standard_tool(
 
 async def _wait_standard(
     coordinator: Coordinator,
-    resource: str,
+    resource: Any,
     timeout_seconds: float,
 ) -> dict[str, Any]:
     """Async poll loop for standard-mode agenthold_wait."""
     try:
-        _validate_identifier(resource, "resource")
-        normalized = Coordinator._normalize_resource(resource)
-        if not normalized:
-            raise ValueError("resource must not be empty after normalization")
+        rid = coordinator.canonicalize(resource)
     except ValueError as e:
         return {"status": "error", "message": str(e)}
     if timeout_seconds < 0:
         return {"status": "error", "message": "timeout_seconds must be >= 0"}
 
+    key = rid.to_uri()
     start = time.monotonic()
     deadline = start + timeout_seconds
 
     while True:
         try:
-            state = coordinator.interpret_state(resource)
+            state = coordinator._interpret_state_by_uri(key)
         except BusyError:
-            # Transient lock contention — keep polling.
             now = time.monotonic()
             if now >= deadline:
                 return {
                     "status": "timeout",
-                    "resource": coordinator._normalize_resource(resource),
+                    "resource": key,
                     "elapsed_seconds": round(now - start, 3),
                     "hint": (
                         "Timed out while the database was locked. "
@@ -747,17 +868,35 @@ async def _wait_standard(
             continue
 
         if state["state"] in ("unclaimed", "free", "expired"):
-            return {
+            response: dict[str, Any] = {
                 "status": "available",
-                "resource": state["resource"],
+                "resource": key,
                 "elapsed_seconds": round(time.monotonic() - start, 3),
             }
+            if state["state"] == "free":
+                outcome = state.get("outcome", "released")
+                response["previous_outcome"] = outcome
+                response["previous_holder"] = state.get("released_by", "unknown")
+                response["previous_outcome_at"] = state.get("released_at", "unknown")
+                if outcome == "moved" and state.get("moved_to"):
+                    response["moved_to"] = state["moved_to"]
+                hint = Coordinator._hint_for_outcome(outcome)
+                if hint:
+                    response["hint"] = hint
+            elif state["state"] == "expired":
+                response["previous_outcome"] = "expired"
+                response["previous_holder"] = state.get("held_by", "unknown")
+                response["previous_outcome_at"] = state.get("claimed_at", "unknown")
+                hint = Coordinator._hint_for_outcome("expired")
+                if hint:
+                    response["hint"] = hint
+            return response
 
         now = time.monotonic()
         if now >= deadline:
             return {
                 "status": "timeout",
-                "resource": state["resource"],
+                "resource": key,
                 "held_by": state.get("held_by", "unknown"),
                 "claimed_at": state.get("claimed_at", "unknown"),
                 "elapsed_seconds": round(now - start, 3),
@@ -771,9 +910,9 @@ async def _wait_standard(
         await asyncio.sleep(0.2)
 
 
-# -----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Advanced mode dispatch (get / set / list / history / delete / ...)
-# -----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 
 def _dispatch(store: StateStore, name: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -1021,9 +1160,8 @@ async def _watch(
                     "updated_at": record.updated_at.isoformat(),
                 }
         except NotFoundError:
-            pass  # version 0; keep waiting
+            pass
         except BusyError:
-            # Transient lock contention — keep polling.
             pass
 
         now = time.monotonic()
@@ -1044,21 +1182,62 @@ async def _watch(
         await asyncio.sleep(0.2)
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def _parse_workspace_arg(arg: str) -> Workspace:
+    """Parse a --workspace argument.
+
+    Accepted forms:
+      name=path           Both required; explicit naming.
+      /abs/path           Absolute path; name derived from final component.
+                          On Windows, the path may use backslashes.
+    """
+    if "=" in arg:
+        name, _, root = arg.partition("=")
+        if not name or not root:
+            raise ValueError(f"Invalid --workspace value {arg!r}: expected 'name=path'")
+        return Workspace(name=name, root=root)
+    # Path-only form — derive name from basename
+    norm = arg.replace("\\", "/").rstrip("/")
+    if not norm.startswith("/") and not (
+        len(norm) >= 3 and norm[1] == ":" and norm[2] == "/"
+    ):
+        raise ValueError(
+            f"Invalid --workspace value {arg!r}: expected 'name=path' or "
+            "an absolute path"
+        )
+    name = norm.rsplit("/", 1)[-1]
+    if not name:
+        name = DEFAULT_WORKSPACE_NAME
+    return Workspace(name=name, root=arg)
+
+
+def _build_workspaces(raw_args: list[str] | None) -> list[Workspace]:
+    if not raw_args:
+        return [Workspace(name=DEFAULT_WORKSPACE_NAME, root=os.getcwd())]
+    return [_parse_workspace_arg(a) for a in raw_args]
+
+
 async def _run_server(  # pragma: no cover
     db_path: str | Path,
+    workspaces: list[Workspace],
     tools_mode: str = "standard",
     claim_ttl: float | None = None,
 ) -> None:
+    registry = WorkspaceRegistry(workspaces)
     store = StateStore(db_path)
-    coordinator = Coordinator(store, claim_ttl=claim_ttl)
-    server = _make_server_from_parts(store, coordinator, tools_mode=tools_mode)
+    coordinator = Coordinator(store, registry, claim_ttl=claim_ttl)
+    server = _make_server_from_parts(
+        store, coordinator, registry, tools_mode=tools_mode
+    )
     async with stdio_server() as (read_stream, write_stream):
         init_options = server.create_initialization_options()
         try:
             await server.run(read_stream, write_stream, init_options)
         finally:
-            # Disconnect cleanup: release all claims held by agents
-            # registered on this process and mark them inactive.
             if tools_mode == "standard":
                 _cleanup_agents(coordinator)
 
@@ -1066,11 +1245,7 @@ async def _run_server(  # pragma: no cover
 def _cleanup_agents(  # pragma: no cover
     coordinator: Coordinator,
 ) -> None:
-    """Release claims and deactivate agents on disconnect.
-
-    Best-effort — failures are silently ignored since the process
-    is shutting down.
-    """
+    """Release claims and deactivate agents on disconnect."""
     for agent_id in list(coordinator._registered_agents):
         coordinator.release_all(agent_id)
         coordinator.deactivate_agent(agent_id)
@@ -1101,10 +1276,23 @@ def main() -> None:  # pragma: no cover
             "(default: no expiry). Only applies in standard mode."
         ),
     )
+    parser.add_argument(
+        "--workspace",
+        action="append",
+        default=None,
+        help=(
+            "Configure a workspace as 'name=path' (e.g. 'myproj=/abs/path') "
+            "or as an absolute path (name derived from basename). "
+            "Repeatable. If omitted, a single workspace named 'default' is "
+            "created at the current working directory."
+        ),
+    )
     args = parser.parse_args()
+    workspaces = _build_workspaces(args.workspace)
     asyncio.run(
         _run_server(
             args.db,
+            workspaces=workspaces,
             tools_mode=args.tools,
             claim_ttl=args.claim_ttl,
         )

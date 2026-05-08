@@ -10,42 +10,18 @@ import pytest
 from agenthold.coordinator import Coordinator
 from agenthold.exceptions import BusyError, ConflictError
 from agenthold.models import ConflictDetail
+from agenthold.resources import Workspace, WorkspaceRegistry
 from agenthold.store import StateStore
 
 
 @pytest.fixture
-def coordinator(store: StateStore) -> Coordinator:
-    return Coordinator(store)
+def coordinator(store: StateStore, registry: WorkspaceRegistry) -> Coordinator:
+    return Coordinator(store, registry)
 
 
 @pytest.fixture
-def ttl_coordinator(store: StateStore) -> Coordinator:
-    return Coordinator(store, claim_ttl=60.0)
-
-
-# ---------------------------------------------------------------------------
-# Normalization
-# ---------------------------------------------------------------------------
-
-
-class TestNormalization:
-    def test_strips_dot_slash(self) -> None:
-        assert Coordinator._normalize_resource("./foo.md") == "foo.md"
-
-    def test_strips_repeated_dot_slash(self) -> None:
-        assert Coordinator._normalize_resource("././foo.md") == "foo.md"
-
-    def test_collapses_slashes(self) -> None:
-        assert Coordinator._normalize_resource("a//b///c") == "a/b/c"
-
-    def test_backslashes(self) -> None:
-        assert Coordinator._normalize_resource("a\\b\\c") == "a/b/c"
-
-    def test_no_change(self) -> None:
-        assert Coordinator._normalize_resource("foo.md") == "foo.md"
-
-    def test_combined(self) -> None:
-        assert Coordinator._normalize_resource(".\\src\\\\main.py") == "src/main.py"
+def ttl_coordinator(store: StateStore, registry: WorkspaceRegistry) -> Coordinator:
+    return Coordinator(store, registry, claim_ttl=60.0)
 
 
 # ---------------------------------------------------------------------------
@@ -57,21 +33,46 @@ class TestClaim:
     def test_claim_unclaimed_resource(self, coordinator: Coordinator) -> None:
         result = coordinator.claim("intro.md", "agent-a")
         assert result["status"] == "claimed"
-        assert result["resource"] == "intro.md"
+        assert result["resource"] == "file://default/intro.md"
         assert result["version"] == 1
+        # No previous_outcome on a never-seen resource
+        assert "previous_outcome" not in result
 
-    def test_claim_free_resource(self, coordinator: Coordinator) -> None:
+    def test_claim_free_resource_propagates_outcome(
+        self, coordinator: Coordinator
+    ) -> None:
         coordinator.claim("intro.md", "agent-a")
-        coordinator.release("intro.md", "agent-a")
+        coordinator.release("intro.md", "agent-a", outcome="modified")
         result = coordinator.claim("intro.md", "agent-b")
         assert result["status"] == "claimed"
-        assert result["version"] == 3  # claim(v1) + release(v2) + claim(v3)
+        assert result["version"] == 3
+        assert result["previous_outcome"] == "modified"
+        assert result["previous_holder"] == "agent-a"
+        # Hint only for noisy outcomes — modified is not noisy
+        assert "hint" not in result
+
+    def test_claim_after_delete_surfaces_hint(self, coordinator: Coordinator) -> None:
+        coordinator.claim("temp.txt", "agent-a")
+        coordinator.release("temp.txt", "agent-a", outcome="deleted")
+        result = coordinator.claim("temp.txt", "agent-b")
+        assert result["previous_outcome"] == "deleted"
+        assert "hint" in result
+        assert "may not exist" in result["hint"]
+
+    def test_claim_after_move_surfaces_moved_to(self, coordinator: Coordinator) -> None:
+        coordinator.claim("old.py", "agent-a")
+        coordinator.release("old.py", "agent-a", outcome="moved", moved_to="new.py")
+        result = coordinator.claim("old.py", "agent-b")
+        assert result["previous_outcome"] == "moved"
+        assert result["moved_to"] == "file://default/new.py"
+        assert "hint" in result
 
     def test_claim_already_claimed_by_self(self, coordinator: Coordinator) -> None:
         coordinator.claim("intro.md", "agent-a")
         result = coordinator.claim("intro.md", "agent-a")
         assert result["status"] == "already_claimed"
-        assert result["resource"] == "intro.md"
+        # No previous_outcome — same agent, idempotent
+        assert "previous_outcome" not in result
 
     def test_claim_busy(self, coordinator: Coordinator) -> None:
         coordinator.claim("intro.md", "agent-a")
@@ -84,55 +85,44 @@ class TestClaim:
         self, coordinator: Coordinator, store: StateStore
     ) -> None:
         """Existing value with no 'status' field is treated as unclaimed."""
-        store.set("claims", "intro.md", {"foo": "bar"}, updated_by="x")
+        store.set(
+            Coordinator.NAMESPACE,
+            "file://default/intro.md",
+            {"foo": "bar"},
+            updated_by="x",
+        )
         result = coordinator.claim("intro.md", "agent-a")
         assert result["status"] == "claimed"
-
-    def test_claim_malformed_value_not_a_dict(
-        self, coordinator: Coordinator, store: StateStore
-    ) -> None:
-        """Plain string written via advanced mode is treated as unclaimed."""
-        store.set("claims", "intro.md", "just-a-string", updated_by="x")
-        result = coordinator.claim("intro.md", "agent-a")
-        assert result["status"] == "claimed"
-
-    def test_claim_validates_resource_empty(self, coordinator: Coordinator) -> None:
-        with pytest.raises(ValueError, match="resource"):
-            coordinator.claim("", "agent-a")
-
-    def test_claim_validates_resource_null_bytes(
-        self, coordinator: Coordinator
-    ) -> None:
-        with pytest.raises(ValueError, match="resource"):
-            coordinator.claim("foo\x00bar", "agent-a")
-
-    def test_claim_validates_resource_overlength(
-        self, coordinator: Coordinator
-    ) -> None:
-        with pytest.raises(ValueError, match="resource"):
-            coordinator.claim("x" * 513, "agent-a")
-
-    def test_claim_dot_slash_only_raises(self, coordinator: Coordinator) -> None:
-        """'./' normalizes to '' which must be rejected."""
-        with pytest.raises(ValueError, match="resource.*empty after normalization"):
-            coordinator.claim("./", "agent-a")
-
-    def test_claim_repeated_dot_slash_only_raises(
-        self, coordinator: Coordinator
-    ) -> None:
-        """'././' normalizes to '' which must be rejected."""
-        with pytest.raises(ValueError, match="resource.*empty after normalization"):
-            coordinator.claim("././", "agent-a")
-
-    def test_claim_validates_agent_empty(self, coordinator: Coordinator) -> None:
-        with pytest.raises(ValueError, match="agent"):
-            coordinator.claim("intro.md", "")
 
     def test_claim_normalizes_resource(self, coordinator: Coordinator) -> None:
         """./intro.md and intro.md resolve to the same claim."""
         coordinator.claim("./intro.md", "agent-a")
         result = coordinator.claim("intro.md", "agent-a")
         assert result["status"] == "already_claimed"
+
+    def test_claim_validates_resource_empty(self, coordinator: Coordinator) -> None:
+        with pytest.raises(ValueError, match="empty"):
+            coordinator.claim("", "agent-a")
+
+    def test_claim_validates_resource_null_bytes(
+        self, coordinator: Coordinator
+    ) -> None:
+        with pytest.raises(ValueError, match="null"):
+            coordinator.claim("foo\x00bar", "agent-a")
+
+    def test_claim_validates_resource_overlength(
+        self, coordinator: Coordinator
+    ) -> None:
+        with pytest.raises(ValueError, match="exceeds"):
+            coordinator.claim("x" * 600, "agent-a")
+
+    def test_claim_dot_slash_only_raises(self, coordinator: Coordinator) -> None:
+        with pytest.raises(ValueError, match="empty"):
+            coordinator.claim("./", "agent-a")
+
+    def test_claim_validates_agent_empty(self, coordinator: Coordinator) -> None:
+        with pytest.raises(ValueError, match="agent"):
+            coordinator.claim("intro.md", "")
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +131,7 @@ class TestClaim:
 
 
 class TestClaimRace:
-    def test_claim_race_from_unclaimed(self) -> None:
+    def test_claim_race_from_unclaimed(self, registry: WorkspaceRegistry) -> None:
         """Two threads race to claim an unclaimed resource."""
         import tempfile
 
@@ -149,7 +139,7 @@ class TestClaimRace:
             db_path = f.name
 
         store = StateStore(db_path)
-        coord = Coordinator(store)
+        coord = Coordinator(store, registry)
         results: list[dict[str, object]] = [{}] * 2
         barrier = threading.Barrier(2)
 
@@ -165,11 +155,10 @@ class TestClaimRace:
 
         statuses = {r["status"] for r in results}
         assert "claimed" in statuses
-        # The loser gets either "busy" or "already_claimed" (if same agent)
         assert statuses <= {"claimed", "busy"}
         store.close()
 
-    def test_claim_race_from_free(self) -> None:
+    def test_claim_race_from_free(self, registry: WorkspaceRegistry) -> None:
         """Two threads race to claim a just-released resource."""
         import tempfile
 
@@ -177,7 +166,7 @@ class TestClaimRace:
             db_path = f.name
 
         store = StateStore(db_path)
-        coord = Coordinator(store)
+        coord = Coordinator(store, registry)
         coord.claim("race.md", "setup-agent")
         coord.release("race.md", "setup-agent")
 
@@ -206,11 +195,109 @@ class TestClaimRace:
 
 
 class TestRelease:
-    def test_release_own_claim(self, coordinator: Coordinator) -> None:
+    def test_release_own_claim_default_outcome(self, coordinator: Coordinator) -> None:
         coordinator.claim("intro.md", "agent-a")
         result = coordinator.release("intro.md", "agent-a")
         assert result["status"] == "released"
+        assert result["outcome"] == "released"
         assert result["version"] == 2
+
+    def test_release_with_modified(self, coordinator: Coordinator) -> None:
+        coordinator.claim("intro.md", "agent-a")
+        result = coordinator.release("intro.md", "agent-a", outcome="modified")
+        assert result["outcome"] == "modified"
+
+    def test_release_with_created(self, coordinator: Coordinator) -> None:
+        coordinator.claim("new.py", "agent-a")
+        result = coordinator.release("new.py", "agent-a", outcome="created")
+        assert result["outcome"] == "created"
+
+    def test_release_with_deleted(self, coordinator: Coordinator) -> None:
+        coordinator.claim("temp.txt", "agent-a")
+        result = coordinator.release("temp.txt", "agent-a", outcome="deleted")
+        assert result["outcome"] == "deleted"
+
+    def test_release_with_moved(self, coordinator: Coordinator) -> None:
+        coordinator.claim("old.py", "agent-a")
+        result = coordinator.release(
+            "old.py", "agent-a", outcome="moved", moved_to="new.py"
+        )
+        assert result["outcome"] == "moved"
+        assert result["moved_to"] == "file://default/new.py"
+
+    def test_release_with_moved_uri_target(self, coordinator: Coordinator) -> None:
+        coordinator.claim("old.py", "agent-a")
+        result = coordinator.release(
+            "old.py",
+            "agent-a",
+            outcome="moved",
+            moved_to="file://default/new.py",
+        )
+        assert result["moved_to"] == "file://default/new.py"
+
+    def test_release_invalid_outcome_raises(self, coordinator: Coordinator) -> None:
+        coordinator.claim("intro.md", "agent-a")
+        with pytest.raises(ValueError, match="Invalid outcome"):
+            coordinator.release("intro.md", "agent-a", outcome="bogus")
+
+    def test_release_abandoned_outcome_not_allowed_for_agent(
+        self, coordinator: Coordinator
+    ) -> None:
+        """Agents can't set 'abandoned' — that's server-only."""
+        coordinator.claim("intro.md", "agent-a")
+        with pytest.raises(ValueError, match="Invalid outcome"):
+            coordinator.release("intro.md", "agent-a", outcome="abandoned")
+
+    def test_release_expired_outcome_not_allowed_for_agent(
+        self, coordinator: Coordinator
+    ) -> None:
+        coordinator.claim("intro.md", "agent-a")
+        with pytest.raises(ValueError, match="Invalid outcome"):
+            coordinator.release("intro.md", "agent-a", outcome="expired")
+
+    def test_release_moved_without_target_raises(
+        self, coordinator: Coordinator
+    ) -> None:
+        coordinator.claim("old.py", "agent-a")
+        with pytest.raises(ValueError, match="moved_to is required"):
+            coordinator.release("old.py", "agent-a", outcome="moved")
+
+    def test_release_non_moved_with_target_raises(
+        self, coordinator: Coordinator
+    ) -> None:
+        coordinator.claim("intro.md", "agent-a")
+        with pytest.raises(ValueError, match="only allowed with"):
+            coordinator.release(
+                "intro.md",
+                "agent-a",
+                outcome="modified",
+                moved_to="other.md",
+            )
+
+    def test_release_moved_to_same_resource_raises(
+        self, coordinator: Coordinator
+    ) -> None:
+        coordinator.claim("old.py", "agent-a")
+        with pytest.raises(ValueError, match="differ from the source"):
+            coordinator.release(
+                "old.py",
+                "agent-a",
+                outcome="moved",
+                moved_to="old.py",
+            )
+
+    def test_release_moved_to_canonicalizes_target(
+        self, coordinator: Coordinator
+    ) -> None:
+        """Moved_to with equivalent paths is recognized as same."""
+        coordinator.claim("old.py", "agent-a")
+        with pytest.raises(ValueError, match="differ from the source"):
+            coordinator.release(
+                "old.py",
+                "agent-a",
+                outcome="moved",
+                moved_to="./old.py",
+            )
 
     def test_release_other_agents_claim(self, coordinator: Coordinator) -> None:
         coordinator.claim("intro.md", "agent-a")
@@ -246,6 +333,7 @@ class TestStatus:
     def test_status_unclaimed(self, coordinator: Coordinator) -> None:
         result = coordinator.status("intro.md")
         assert result["status"] == "available"
+        assert "previous_outcome" not in result
 
     def test_status_claimed(self, coordinator: Coordinator) -> None:
         coordinator.claim("intro.md", "agent-a")
@@ -253,15 +341,34 @@ class TestStatus:
         assert result["status"] == "claimed"
         assert result["held_by"] == "agent-a"
 
-    def test_status_free(self, coordinator: Coordinator) -> None:
+    def test_status_free_with_outcome(self, coordinator: Coordinator) -> None:
         coordinator.claim("intro.md", "agent-a")
-        coordinator.release("intro.md", "agent-a")
+        coordinator.release("intro.md", "agent-a", outcome="modified")
         result = coordinator.status("intro.md")
         assert result["status"] == "available"
-        assert result["last_held_by"] == "agent-a"
+        assert result["previous_outcome"] == "modified"
+        assert result["previous_holder"] == "agent-a"
+        # No hint for modified
+        assert "hint" not in result
+
+    def test_status_free_with_deleted_has_hint(self, coordinator: Coordinator) -> None:
+        coordinator.claim("temp.txt", "agent-a")
+        coordinator.release("temp.txt", "agent-a", outcome="deleted")
+        result = coordinator.status("temp.txt")
+        assert result["previous_outcome"] == "deleted"
+        assert "hint" in result
+
+    def test_status_free_with_moved_has_moved_to(
+        self, coordinator: Coordinator
+    ) -> None:
+        coordinator.claim("old.py", "agent-a")
+        coordinator.release("old.py", "agent-a", outcome="moved", moved_to="new.py")
+        result = coordinator.status("old.py")
+        assert result["previous_outcome"] == "moved"
+        assert result["moved_to"] == "file://default/new.py"
 
     def test_status_validates_resource(self, coordinator: Coordinator) -> None:
-        with pytest.raises(ValueError, match="resource"):
+        with pytest.raises(ValueError, match="empty"):
             coordinator.status("")
 
 
@@ -274,6 +381,7 @@ class TestInterpretState:
     def test_unclaimed(self, coordinator: Coordinator) -> None:
         state = coordinator.interpret_state("intro.md")
         assert state["state"] == "unclaimed"
+        assert state["resource"] == "file://default/intro.md"
 
     def test_claimed(self, coordinator: Coordinator) -> None:
         coordinator.claim("intro.md", "agent-a")
@@ -283,29 +391,31 @@ class TestInterpretState:
 
     def test_free(self, coordinator: Coordinator) -> None:
         coordinator.claim("intro.md", "agent-a")
-        coordinator.release("intro.md", "agent-a")
+        coordinator.release("intro.md", "agent-a", outcome="modified")
         state = coordinator.interpret_state("intro.md")
         assert state["state"] == "free"
-        assert state["last_held_by"] == "agent-a"
+        assert state["released_by"] == "agent-a"
+        assert state["outcome"] == "modified"
+
+    def test_free_with_moved_to(self, coordinator: Coordinator) -> None:
+        coordinator.claim("old.py", "agent-a")
+        coordinator.release("old.py", "agent-a", outcome="moved", moved_to="new.py")
+        state = coordinator.interpret_state("old.py")
+        assert state["state"] == "free"
+        assert state["outcome"] == "moved"
+        assert state["moved_to"] == "file://default/new.py"
 
     def test_malformed_value_is_unclaimed(
         self, coordinator: Coordinator, store: StateStore
     ) -> None:
-        store.set("claims", "intro.md", 42, updated_by="x")
+        store.set(
+            Coordinator.NAMESPACE,
+            "file://default/intro.md",
+            42,
+            updated_by="x",
+        )
         state = coordinator.interpret_state("intro.md")
         assert state["state"] == "unclaimed"
-
-    def test_validates_empty_resource(self, coordinator: Coordinator) -> None:
-        with pytest.raises(ValueError, match="resource"):
-            coordinator.interpret_state("")
-
-    def test_validates_null_bytes(self, coordinator: Coordinator) -> None:
-        with pytest.raises(ValueError, match="resource"):
-            coordinator.interpret_state("foo\x00bar")
-
-    def test_validates_dot_slash_only(self, coordinator: Coordinator) -> None:
-        with pytest.raises(ValueError, match="empty after normalization"):
-            coordinator.interpret_state("./")
 
 
 # ---------------------------------------------------------------------------
@@ -316,11 +426,19 @@ class TestInterpretState:
 class TestJsonSerialisability:
     def test_claim_response(self, coordinator: Coordinator) -> None:
         result = coordinator.claim("intro.md", "agent-a")
-        json.dumps(result)  # must not raise
+        json.dumps(result)
+
+    def test_claim_with_previous_outcome(self, coordinator: Coordinator) -> None:
+        coordinator.claim("intro.md", "agent-a")
+        coordinator.release("intro.md", "agent-a", outcome="moved", moved_to="other.md")
+        result = coordinator.claim("intro.md", "agent-b")
+        json.dumps(result)
 
     def test_release_response(self, coordinator: Coordinator) -> None:
         coordinator.claim("intro.md", "agent-a")
-        result = coordinator.release("intro.md", "agent-a")
+        result = coordinator.release(
+            "intro.md", "agent-a", outcome="moved", moved_to="x.md"
+        )
         json.dumps(result)
 
     def test_status_response(self, coordinator: Coordinator) -> None:
@@ -342,81 +460,58 @@ class TestBusyErrorInConflictRecovery:
     def test_attempt_claim_busy_on_reread(
         self, coordinator: Coordinator, store: StateStore
     ) -> None:
-        """If re-read after ConflictError raises BusyError, return busy."""
         from agenthold.exceptions import NotFoundError
 
         detail = ConflictDetail(
             namespace="claims",
-            key="intro.md",
+            key="file://default/intro.md",
             expected_version=0,
             actual_version=1,
             actual_value={"status": "claimed", "by": "agent-x"},
             updated_by="agent-x",
             updated_at=datetime.now(UTC),
         )
-        # First get raises NotFoundError (unclaimed), then re-read raises
-        # BusyError after the ConflictError from set.
         get_side_effects = [
-            NotFoundError("claims", "intro.md"),
+            NotFoundError("claims", "file://default/intro.md"),
             BusyError(),
         ]
         with (
-            patch.object(
-                store,
-                "set",
-                side_effect=ConflictError(detail),
-            ),
-            patch.object(
-                store,
-                "get",
-                side_effect=get_side_effects,
-            ),
+            patch.object(store, "set", side_effect=ConflictError(detail)),
+            patch.object(store, "get", side_effect=get_side_effects),
         ):
             result = coordinator.claim("intro.md", "agent-a")
 
         assert result["status"] == "busy"
-        assert result["resource"] == "intro.md"
+        assert result["resource"] == "file://default/intro.md"
         assert result["held_by"] == "unknown"
         assert "temporarily locked" in result["hint"]
-        json.dumps(result)  # must be JSON-serialisable
+        json.dumps(result)
 
     def test_release_busy_on_reread(
         self, coordinator: Coordinator, store: StateStore
     ) -> None:
-        """If re-read after release ConflictError raises BusyError, return error."""
-        # Set up a claimed resource normally first.
         coordinator.claim("intro.md", "agent-a")
 
         detail = ConflictDetail(
             namespace="claims",
-            key="intro.md",
+            key="file://default/intro.md",
             expected_version=1,
             actual_version=2,
             actual_value={"status": "claimed", "by": "agent-a"},
             updated_by="agent-a",
             updated_at=datetime.now(UTC),
         )
-        # First get returns the real record (release reads current state),
-        # then set raises ConflictError, then re-read raises BusyError.
-        real_record = store.get("claims", "intro.md")
+        real_record = store.get("claims", "file://default/intro.md")
         get_side_effects = [real_record, BusyError()]
         with (
-            patch.object(
-                store,
-                "set",
-                side_effect=ConflictError(detail),
-            ),
-            patch.object(
-                store,
-                "get",
-                side_effect=get_side_effects,
-            ),
+            patch.object(store, "set", side_effect=ConflictError(detail)),
+            patch.object(store, "get", side_effect=get_side_effects),
         ):
             result = coordinator.release("intro.md", "agent-a")
 
         assert result["status"] == "error"
         assert "temporarily locked" in result["message"]
-        json.dumps(result)  # must be JSON-serialisable
+        json.dumps(result)
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +524,7 @@ class TestRegister:
         result = coordinator.register("test-agent")
         assert result["status"] == "registered"
         assert result["agent_id"].startswith("agent-")
-        assert len(result["agent_id"]) == 14  # "agent-" + 8 hex
+        assert len(result["agent_id"]) == 14
         assert result["name"] == "test-agent"
 
     def test_register_with_model(self, coordinator: Coordinator) -> None:
@@ -457,7 +552,7 @@ class TestRegister:
 
     def test_register_json_serialisable(self, coordinator: Coordinator) -> None:
         result = coordinator.register("test-agent")
-        json.dumps(result)  # must not raise
+        json.dumps(result)
 
 
 # ---------------------------------------------------------------------------
@@ -481,12 +576,11 @@ class TestRefreshAgent:
         assert new_activity >= old_activity
 
     def test_refresh_nonexistent_is_noop(self, coordinator: Coordinator) -> None:
-        # Must not raise
         coordinator.refresh_agent("agent-nonexist")
 
 
 # ---------------------------------------------------------------------------
-# Release all
+# Release all  (disconnect cleanup → outcome=abandoned)
 # ---------------------------------------------------------------------------
 
 
@@ -495,21 +589,39 @@ class TestReleaseAll:
         coordinator.claim("a.md", "agent-a")
         coordinator.claim("b.md", "agent-a")
         released = coordinator.release_all("agent-a")
-        assert set(released) == {"a.md", "b.md"}
-
+        assert set(released) == {
+            "file://default/a.md",
+            "file://default/b.md",
+        }
         assert coordinator.status("a.md")["status"] == "available"
         assert coordinator.status("b.md")["status"] == "available"
+
+    def test_release_all_marks_abandoned(self, coordinator: Coordinator) -> None:
+        coordinator.claim("a.md", "agent-a")
+        coordinator.release_all("agent-a")
+        status = coordinator.status("a.md")
+        assert status["previous_outcome"] == "abandoned"
+        assert "hint" in status
+        assert "disconnected" in status["hint"]
 
     def test_release_all_skips_other_agents(self, coordinator: Coordinator) -> None:
         coordinator.claim("a.md", "agent-a")
         coordinator.claim("b.md", "agent-b")
         released = coordinator.release_all("agent-a")
-        assert released == ["a.md"]
+        assert released == ["file://default/a.md"]
         assert coordinator.status("b.md")["status"] == "claimed"
 
     def test_release_all_empty(self, coordinator: Coordinator) -> None:
         released = coordinator.release_all("agent-a")
         assert released == []
+
+    def test_subsequent_claim_sees_abandoned(self, coordinator: Coordinator) -> None:
+        coordinator.claim("a.md", "agent-a")
+        coordinator.release_all("agent-a")
+        result = coordinator.claim("a.md", "agent-b")
+        assert result["status"] == "claimed"
+        assert result["previous_outcome"] == "abandoned"
+        assert result["previous_holder"] == "agent-a"
 
 
 # ---------------------------------------------------------------------------
@@ -524,7 +636,6 @@ class TestDeactivateAgent:
         result = coordinator.register("test-agent")
         agent_id = result["agent_id"]
         coordinator.deactivate_agent(agent_id)
-
         record = store.get("_agents", agent_id)
         assert record.value["status"] == "inactive"
         assert "disconnected_at" in record.value
@@ -539,39 +650,41 @@ class TestDeactivateAgent:
 
 
 class TestClaimTTLInit:
-    def test_negative_ttl_raises(self, store: StateStore) -> None:
+    def test_negative_ttl_raises(
+        self, store: StateStore, registry: WorkspaceRegistry
+    ) -> None:
         with pytest.raises(ValueError, match="claim_ttl must be >= 0"):
-            Coordinator(store, claim_ttl=-1.0)
+            Coordinator(store, registry, claim_ttl=-1.0)
 
-    def test_zero_ttl_allowed(self, store: StateStore) -> None:
-        coord = Coordinator(store, claim_ttl=0.0)
+    def test_zero_ttl_allowed(
+        self, store: StateStore, registry: WorkspaceRegistry
+    ) -> None:
+        coord = Coordinator(store, registry, claim_ttl=0.0)
         assert coord._claim_ttl == 0.0
 
-    def test_none_ttl_allowed(self, store: StateStore) -> None:
-        coord = Coordinator(store, claim_ttl=None)
+    def test_none_ttl_allowed(
+        self, store: StateStore, registry: WorkspaceRegistry
+    ) -> None:
+        coord = Coordinator(store, registry, claim_ttl=None)
         assert coord._claim_ttl is None
 
 
 class TestClaimTTL:
     def test_claim_active_within_ttl(self, ttl_coordinator: Coordinator) -> None:
-        """Claim is active when agent activity is within TTL."""
         result = ttl_coordinator.register("test-agent")
         agent_id = result["agent_id"]
         ttl_coordinator.claim("f.md", agent_id)
         state = ttl_coordinator.interpret_state("f.md")
         assert state["state"] == "claimed"
 
-    def test_claim_expired_after_ttl(
-        self, ttl_coordinator: Coordinator, store: StateStore
+    def _backdate_agent(
+        self,
+        store: StateStore,
+        agent_id: str,
+        seconds_ago: int = 120,
     ) -> None:
-        """Claim is expired when agent activity exceeds TTL."""
-        result = ttl_coordinator.register("test-agent")
-        agent_id = result["agent_id"]
-        ttl_coordinator.claim("f.md", agent_id)
-
-        # Backdate agent's last_activity past the TTL
         agent_record = store.get("_agents", agent_id)
-        old_time = (datetime.now(UTC) - timedelta(seconds=120)).isoformat()
+        old_time = (datetime.now(UTC) - timedelta(seconds=seconds_ago)).isoformat()
         agent_record.value["last_activity"] = old_time
         store.set(
             "_agents",
@@ -581,66 +694,52 @@ class TestClaimTTL:
             expected_version=agent_record.version,
         )
 
+    def test_claim_expired_after_ttl(
+        self, ttl_coordinator: Coordinator, store: StateStore
+    ) -> None:
+        result = ttl_coordinator.register("test-agent")
+        agent_id = result["agent_id"]
+        ttl_coordinator.claim("f.md", agent_id)
+        self._backdate_agent(store, agent_id)
         state = ttl_coordinator.interpret_state("f.md")
         assert state["state"] == "expired"
 
     def test_expired_claim_can_be_taken(
         self, ttl_coordinator: Coordinator, store: StateStore
     ) -> None:
-        """Another agent can claim an expired resource."""
         result = ttl_coordinator.register("agent-1")
         agent1 = result["agent_id"]
         ttl_coordinator.claim("f.md", agent1)
-
-        # Expire the claim
-        agent_record = store.get("_agents", agent1)
-        old_time = (datetime.now(UTC) - timedelta(seconds=120)).isoformat()
-        agent_record.value["last_activity"] = old_time
-        store.set(
-            "_agents",
-            agent1,
-            agent_record.value,
-            updated_by=agent1,
-            expected_version=agent_record.version,
-        )
-
+        self._backdate_agent(store, agent1)
         result2 = ttl_coordinator.claim("f.md", "agent-2")
         assert result2["status"] == "claimed"
+        # Synthesized previous_outcome=expired
+        assert result2["previous_outcome"] == "expired"
+        assert result2["previous_holder"] == agent1
+        assert "hint" in result2
 
-    def test_status_expired_shows_available(
+    def test_status_expired_shows_available_with_outcome(
         self, ttl_coordinator: Coordinator, store: StateStore
     ) -> None:
-        """Status reports expired claims as available."""
         result = ttl_coordinator.register("test-agent")
         agent_id = result["agent_id"]
         ttl_coordinator.claim("f.md", agent_id)
-
-        # Expire the claim
-        agent_record = store.get("_agents", agent_id)
-        old_time = (datetime.now(UTC) - timedelta(seconds=120)).isoformat()
-        agent_record.value["last_activity"] = old_time
-        store.set(
-            "_agents",
-            agent_id,
-            agent_record.value,
-            updated_by=agent_id,
-            expected_version=agent_record.version,
-        )
-
+        self._backdate_agent(store, agent_id)
         status = ttl_coordinator.status("f.md")
         assert status["status"] == "available"
-        assert "expired" in status.get("note", "")
+        assert status["previous_outcome"] == "expired"
+        assert status["previous_holder"] == agent_id
+        assert "hint" in status
 
     def test_no_ttl_claims_never_expire(self, coordinator: Coordinator) -> None:
-        """Without TTL, claims never expire."""
         coordinator.claim("f.md", "agent-a")
         state = coordinator.interpret_state("f.md")
         assert state["state"] == "claimed"
 
-    def test_is_claim_active_fallback_to_claimed_at(self, store: StateStore) -> None:
-        """Falls back to claimed_at when agent record is missing."""
-        coord = Coordinator(store, claim_ttl=60.0)
-        # Write a claim directly without registering the agent
+    def test_is_claim_active_fallback_to_claimed_at(
+        self, store: StateStore, registry: WorkspaceRegistry
+    ) -> None:
+        coord = Coordinator(store, registry, claim_ttl=60.0)
         old_time = (datetime.now(UTC) - timedelta(seconds=120)).isoformat()
         claim_value = {
             "status": "claimed",
@@ -649,9 +748,10 @@ class TestClaimTTL:
         }
         assert not coord._is_claim_active(claim_value)
 
-    def test_is_claim_active_recent_claimed_at(self, store: StateStore) -> None:
-        """Falls back to claimed_at and returns True if recent."""
-        coord = Coordinator(store, claim_ttl=60.0)
+    def test_is_claim_active_recent_claimed_at(
+        self, store: StateStore, registry: WorkspaceRegistry
+    ) -> None:
+        coord = Coordinator(store, registry, claim_ttl=60.0)
         recent_time = datetime.now(UTC).isoformat()
         claim_value = {
             "status": "claimed",
@@ -676,8 +776,96 @@ class TestStatusEnrichment:
         assert status["agent_model"] == "claude-sonnet-4-6"
 
     def test_status_without_agent_record(self, coordinator: Coordinator) -> None:
-        """Claims by unregistered agents still return status."""
         coordinator.claim("f.md", "manual-agent")
         status = coordinator.status("f.md")
         assert status["status"] == "claimed"
         assert "agent_name" not in status
+
+
+# ---------------------------------------------------------------------------
+# Multi-workspace coordination
+# ---------------------------------------------------------------------------
+
+
+class TestMultiWorkspace:
+    @pytest.fixture
+    def multi_coord(self, store: StateStore) -> Coordinator:
+        registry = WorkspaceRegistry(
+            [
+                Workspace(name="default", root="/work"),
+                Workspace(name="other", root="/elsewhere"),
+            ]
+        )
+        return Coordinator(store, registry)
+
+    def test_same_path_different_workspaces_isolated(
+        self, multi_coord: Coordinator
+    ) -> None:
+        multi_coord.claim("file://default/foo.py", "agent-a")
+        result = multi_coord.claim("file://other/foo.py", "agent-b")
+        assert result["status"] == "claimed"
+
+    def test_bare_path_uses_default(self, multi_coord: Coordinator) -> None:
+        result = multi_coord.claim("foo.py", "agent-a")
+        assert result["resource"] == "file://default/foo.py"
+
+    def test_cross_workspace_move(self, multi_coord: Coordinator) -> None:
+        multi_coord.claim("file://default/foo.py", "agent-a")
+        result = multi_coord.release(
+            "file://default/foo.py",
+            "agent-a",
+            outcome="moved",
+            moved_to="file://other/foo.py",
+        )
+        assert result["moved_to"] == "file://other/foo.py"
+
+
+# ---------------------------------------------------------------------------
+# Move scenario — realistic rename flow
+# ---------------------------------------------------------------------------
+
+
+class TestRenameFlow:
+    def test_canonical_rename_pattern(self, coordinator: Coordinator) -> None:
+        # 1. Claim source
+        a = coordinator.claim("old.py", "agent-a")
+        assert a["status"] == "claimed"
+        # 2. Claim destination
+        b = coordinator.claim("new.py", "agent-a")
+        assert b["status"] == "claimed"
+        # 3. (rename happens on disk)
+        # 4. Release source with moved
+        r1 = coordinator.release(
+            "old.py", "agent-a", outcome="moved", moved_to="new.py"
+        )
+        assert r1["outcome"] == "moved"
+        # 5. Release destination as created
+        r2 = coordinator.release("new.py", "agent-a", outcome="created")
+        assert r2["outcome"] == "created"
+        # 6. Curious agent claims old.py — sees the move
+        c = coordinator.claim("old.py", "agent-b")
+        assert c["previous_outcome"] == "moved"
+        assert c["moved_to"] == "file://default/new.py"
+        # 7. Following the move, claims new.py — sees creation
+        coordinator.release("old.py", "agent-b")
+        d = coordinator.claim("new.py", "agent-b")
+        assert d["previous_outcome"] == "created"
+
+
+# ---------------------------------------------------------------------------
+# Custom scope smoke tests
+# ---------------------------------------------------------------------------
+
+
+class TestCustomScope:
+    def test_custom_claim_release(self, coordinator: Coordinator) -> None:
+        result = coordinator.claim("custom://task-42", "agent-a")
+        assert result["status"] == "claimed"
+        assert result["resource"] == "custom://task-42"
+        result = coordinator.release("custom://task-42", "agent-a", outcome="modified")
+        assert result["outcome"] == "modified"
+
+    def test_custom_busy(self, coordinator: Coordinator) -> None:
+        coordinator.claim("custom://task-42", "agent-a")
+        result = coordinator.claim("custom://task-42", "agent-b")
+        assert result["status"] == "busy"

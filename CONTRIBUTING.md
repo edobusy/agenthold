@@ -70,20 +70,28 @@ There are no contributor licence agreements or special requirements. Small, well
 ```
 src/agenthold/
     __init__.py      public API and version
-    server.py        MCP server and tool registration
+    server.py        MCP server, argparse, tool registration, dispatch
+    coordinator.py   claim lifecycle (register/claim/release/status), outcomes
     store.py         all SQLite operations (the core of the project)
+    resources.py     workspace registry, resource canonicalization, ResourceId
     models.py        Pydantic models for records and errors
-    exceptions.py    ConflictError, NotFoundError
+    exceptions.py    ConflictError, NotFoundError, BusyError
 
 tests/
-    conftest.py      shared fixtures (in-memory store, temp db paths)
-    test_store.py    unit tests for all store operations
-    test_server.py   integration tests for the MCP tool dispatch
-    test_conflicts.py  concurrent write edge cases
+    conftest.py              shared fixtures (in-memory store, registry)
+    test_store.py            unit tests for all store operations
+    test_conflicts.py        concurrent write edge cases (OCC patterns)
+    test_concurrency.py      multi-connection / multi-process safety
+    test_resources.py        workspace registry and canonicalization
+    test_coordinator.py      claim lifecycle, outcomes, TTL
+    test_server.py           advanced-mode dispatch
+    test_server_standard.py  standard-mode dispatch + workspace flag parsing
+    test_watch.py            advanced-mode async polling
+    test_release_script.py   pure-function tests for scripts/release.py
 
 examples/
     order_processing/   two-agent order workflow demo
     budget_allocation/  two-agent budget allocation demo
 ```
 
-The `StateStore` class in `store.py` is the place to start if you are adding a new capability. The MCP tool layer in `server.py` is intentionally thin: it validates inputs, calls the store, and serialises the result.
+The `StateStore` class in `store.py` is the place to start if you are adding a low-level state-store capability. For coordination semantics (claims, outcomes), edit `coordinator.py`. The MCP tool layer in `server.py` is intentionally thin: it validates inputs, calls the store or coordinator, and serialises the result.

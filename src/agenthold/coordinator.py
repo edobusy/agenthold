@@ -1,25 +1,73 @@
 """
 Claim-based coordination layer built on top of StateStore.
 
-Implements a resource claim lifecycle (unclaimed → claimed → free → claimed → ...)
-using the generic get/set primitives with OCC. This is the only module that knows
-about claim semantics — the store layer remains generic.
+Implements a resource claim lifecycle with explicit lifecycle outcomes:
+
+    unclaimed → claimed → free(outcome) → claimed → free(outcome) → ...
+
+Outcomes carried on release tell the next claimant what happened to the
+underlying entity (modified, created, deleted, moved, abandoned, expired).
+This is how agenthold solves the name-vs-entity problem: the claim coordinates
+access to a *name*, but the holder declares what they did to the entity, and
+that declaration is preserved for the next holder to see.
+
+Resources are identified by canonical URIs built from the configured
+workspaces (see resources.py). All public methods accept the raw string an
+agent provides; canonicalization happens at the boundary.
 
 The five high-level operations:
   register : register an agent and receive a unique ID
   claim    : acquire exclusive access to a resource
-  release  : relinquish a claim after finishing work
+  release  : relinquish a claim with an explicit outcome
   status   : check whether a resource is available or held
   wait     : (async, lives in server.py) poll until a resource becomes free
 """
 
-import re
+from __future__ import annotations
+
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from agenthold.exceptions import BusyError, ConflictError, NotFoundError
+from agenthold.resources import (
+    ResourceId,
+    WorkspaceRegistry,
+    parse_resource_input,
+)
 from agenthold.store import StateStore, _validate_identifier
+
+# Outcomes the agent may declare on release.
+AGENT_OUTCOMES: frozenset[str] = frozenset(
+    {"released", "modified", "created", "deleted", "moved"}
+)
+# All outcome values that can appear in stored free-state records or in
+# previous_outcome fields. abandoned/expired are server-set.
+ALL_OUTCOMES: frozenset[str] = AGENT_OUTCOMES | frozenset({"abandoned", "expired"})
+
+# Outcomes that warrant a hint string for the next claimant.
+_NOISY_OUTCOMES: frozenset[str] = frozenset(
+    {"deleted", "moved", "abandoned", "expired"}
+)
+
+_HINT_TEXT: dict[str, str] = {
+    "deleted": (
+        "The previous holder deleted this resource. The path is yours, "
+        "but the file may not exist on disk."
+    ),
+    "moved": (
+        "The previous holder moved this resource. If you wanted to follow "
+        "the move, claim 'moved_to' instead."
+    ),
+    "abandoned": (
+        "The previous holder disconnected without explicitly releasing. "
+        "The disk state is unknown."
+    ),
+    "expired": (
+        "The previous holder's claim expired before they released. "
+        "They may have left the resource in an inconsistent state."
+    ),
+}
 
 
 class Coordinator:
@@ -31,11 +79,13 @@ class Coordinator:
     def __init__(
         self,
         store: StateStore,
+        registry: WorkspaceRegistry,
         claim_ttl: float | None = None,
     ) -> None:
         if claim_ttl is not None and claim_ttl < 0:
             raise ValueError("claim_ttl must be >= 0")
         self._store = store
+        self._registry = registry
         self._claim_ttl = claim_ttl
         self._registered_agents: set[str] = set()
 
@@ -43,32 +93,17 @@ class Coordinator:
     # Helpers
     # ------------------------------------------------------------------
 
+    @property
+    def registry(self) -> WorkspaceRegistry:
+        return self._registry
+
     @staticmethod
     def _now() -> str:
         return datetime.now(UTC).isoformat()
 
-    @staticmethod
-    def _normalize_resource(resource: str) -> str:
-        """Normalize a resource identifier for consistent keying.
-
-        1. Backslashes → forward slashes
-        2. Collapse consecutive slashes
-        3. Strip leading ./
-        """
-        resource = resource.replace("\\", "/")
-        resource = re.sub(r"/+", "/", resource)
-        resource = re.sub(r"^(\./)+", "", resource)
-        return resource
-
-    def _validate_inputs(self, resource: str, agent: str | None = None) -> str:
-        """Validate and normalize inputs. Returns the normalized resource."""
-        _validate_identifier(resource, "resource")
-        if agent is not None:
-            _validate_identifier(agent, "agent")
-        normalized = self._normalize_resource(resource)
-        if not normalized:
-            raise ValueError("resource must not be empty after normalization")
-        return normalized
+    def canonicalize(self, raw: Any) -> ResourceId:
+        """Parse a raw resource input into a canonical ResourceId."""
+        return parse_resource_input(raw, self._registry)
 
     @staticmethod
     def _is_claim_value(value: Any) -> bool:
@@ -76,15 +111,7 @@ class Coordinator:
         return isinstance(value, dict) and "status" in value
 
     def _is_claim_active(self, value: dict[str, Any]) -> bool:
-        """Check if the agent holding a claim is still active.
-
-        Returns True if:
-        - TTL is disabled (claim_ttl is None)
-        - The agent's last_activity is within the TTL window
-        - Falling back to claimed_at if agent record is missing
-
-        Returns False if the claim has expired.
-        """
+        """Check if the agent holding a claim is still active."""
         if self._claim_ttl is None:
             return True
 
@@ -117,7 +144,7 @@ class Coordinator:
             except (ValueError, TypeError):
                 pass
 
-        return False  # Can't determine — treat as expired
+        return False
 
     def _get_agent_info(self, agent_id: str) -> dict[str, str] | None:
         """Look up agent metadata from the _agents namespace."""
@@ -132,22 +159,43 @@ class Coordinator:
         except (NotFoundError, BusyError):
             return None
 
+    @staticmethod
+    def _hint_for_outcome(outcome: str | None) -> str | None:
+        if outcome is None:
+            return None
+        return _HINT_TEXT.get(outcome)
+
+    @staticmethod
+    def _outcome_info_from_free_value(value: dict[str, Any]) -> dict[str, Any]:
+        """Build previous_outcome fields from a stored free-state record."""
+        outcome = value.get("outcome", "released")
+        info: dict[str, Any] = {
+            "previous_outcome": outcome,
+            "previous_holder": value.get("released_by", "unknown"),
+            "previous_outcome_at": value.get("at", "unknown"),
+        }
+        if outcome == "moved":
+            moved_to = value.get("moved_to")
+            if moved_to is not None:
+                info["moved_to"] = moved_to
+        return info
+
     # ------------------------------------------------------------------
-    # Public API
+    # interpret_state
     # ------------------------------------------------------------------
 
-    def interpret_state(self, resource: str) -> dict[str, Any]:
+    def interpret_state(self, raw: Any) -> dict[str, Any]:
         """Read and interpret claim state for a resource.
 
         Used by both status() and the async wait loop in server.py.
-
-        Returns one of:
-        - {"state": "unclaimed", "resource": <normalized>}
-        - {"state": "free", ...}
-        - {"state": "claimed", ...}
-        - {"state": "expired", ...}  (claimed but TTL elapsed)
+        Returns a dict with a "state" key naming one of:
+            unclaimed | free | claimed | expired
+        plus the canonical resource URI and state-specific fields.
         """
-        key = self._validate_inputs(resource)
+        rid = self.canonicalize(raw)
+        return self._interpret_state_by_uri(rid.to_uri())
+
+    def _interpret_state_by_uri(self, key: str) -> dict[str, Any]:
         try:
             record = self._store.get(self.NAMESPACE, key)
         except NotFoundError:
@@ -157,62 +205,88 @@ class Coordinator:
         if not self._is_claim_value(value):
             return {"state": "unclaimed", "resource": key}
 
-        if value.get("status") == "free":
-            return {
+        status = value.get("status")
+
+        if status == "free":
+            outcome = value.get("outcome", "released")
+            info: dict[str, Any] = {
                 "state": "free",
                 "resource": key,
-                "last_held_by": value.get("released_by", "unknown"),
+                "released_by": value.get("released_by", "unknown"),
                 "released_at": value.get("at", "unknown"),
+                "outcome": outcome,
                 "version": record.version,
             }
+            if outcome == "moved":
+                moved_to = value.get("moved_to")
+                if moved_to is not None:
+                    info["moved_to"] = moved_to
+            return info
 
-        if value.get("status") == "claimed":
+        if status == "claimed":
+            held_by = value.get("by", "unknown")
+            claimed_at = value.get("at", "unknown")
             if self._is_claim_active(value):
                 return {
                     "state": "claimed",
                     "resource": key,
-                    "held_by": value.get("by", "unknown"),
-                    "claimed_at": value.get("at", "unknown"),
+                    "held_by": held_by,
+                    "claimed_at": claimed_at,
                     "version": record.version,
                 }
             return {
                 "state": "expired",
                 "resource": key,
-                "held_by": value.get("by", "unknown"),
-                "claimed_at": value.get("at", "unknown"),
+                "held_by": held_by,
+                "claimed_at": claimed_at,
                 "version": record.version,
             }
 
-        # Unknown status field value — treat as unclaimed.
         return {"state": "unclaimed", "resource": key}
 
-    def claim(self, resource: str, agent: str) -> dict[str, Any]:
+    # ------------------------------------------------------------------
+    # claim
+    # ------------------------------------------------------------------
+
+    def claim(self, raw: Any, agent: str) -> dict[str, Any]:
         """Claim exclusive access to a resource."""
-        key = self._validate_inputs(resource, agent)
+        rid = self.canonicalize(raw)
+        _validate_identifier(agent, "agent")
+        key = rid.to_uri()
         now = self._now()
         claim_value = {"status": "claimed", "by": agent, "at": now}
 
         try:
             record = self._store.get(self.NAMESPACE, key)
         except NotFoundError:
-            # UNCLAIMED — first claim, use expected_version=0
-            return self._attempt_claim(key, claim_value, agent, expected_version=0)
+            return self._attempt_claim(
+                key, claim_value, agent, expected_version=0, prior_info=None
+            )
         except BusyError:
             raise
 
         value = record.value
 
-        # Malformed or unknown status → treat as unclaimed, overwrite
+        # Malformed value → treat as unclaimed
         if not self._is_claim_value(value):
             return self._attempt_claim(
-                key, claim_value, agent, expected_version=record.version
+                key,
+                claim_value,
+                agent,
+                expected_version=record.version,
+                prior_info=None,
             )
 
         status = value.get("status")
 
         if status == "free":
+            prior_info = self._outcome_info_from_free_value(value)
             return self._attempt_claim(
-                key, claim_value, agent, expected_version=record.version
+                key,
+                claim_value,
+                agent,
+                expected_version=record.version,
+                prior_info=prior_info,
             )
 
         if status == "claimed":
@@ -222,37 +296,171 @@ class Coordinator:
                     "resource": key,
                     "version": record.version,
                 }
-            # Check if the claim has expired (TTL elapsed)
             if not self._is_claim_active(value):
+                # TTL takeover — synthesize previous_outcome=expired
+                prior_info = {
+                    "previous_outcome": "expired",
+                    "previous_holder": value.get("by", "unknown"),
+                    "previous_outcome_at": value.get("at", "unknown"),
+                }
                 return self._attempt_claim(
                     key,
                     claim_value,
                     agent,
                     expected_version=record.version,
+                    prior_info=prior_info,
                 )
+            return self._busy_response(key, value, record.version)
+
+        # Unknown status → treat as unclaimed
+        return self._attempt_claim(
+            key,
+            claim_value,
+            agent,
+            expected_version=record.version,
+            prior_info=None,
+        )
+
+    def _attempt_claim(
+        self,
+        key: str,
+        claim_value: dict[str, str],
+        agent: str,
+        expected_version: int,
+        prior_info: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Try to write a claim. On conflict, re-read and return busy."""
+        try:
+            result = self._store.set(
+                self.NAMESPACE,
+                key,
+                claim_value,
+                updated_by=agent,
+                expected_version=expected_version,
+            )
+        except ConflictError:
+            return self._handle_claim_conflict(key)
+
+        response: dict[str, Any] = {
+            "status": "claimed",
+            "resource": key,
+            "version": result.version,
+        }
+        if prior_info:
+            response.update(prior_info)
+            hint = self._hint_for_outcome(prior_info.get("previous_outcome"))
+            if hint:
+                response["hint"] = hint
+        return response
+
+    def _handle_claim_conflict(self, key: str) -> dict[str, Any]:
+        """Recover from a ConflictError during _attempt_claim."""
+        try:
+            record = self._store.get(self.NAMESPACE, key)
+        except NotFoundError:
+            return {
+                "status": "error",
+                "message": (
+                    "Conflict occurred but resource no longer exists. Retry the claim."
+                ),
+            }
+        except BusyError:
             return {
                 "status": "busy",
                 "resource": key,
-                "held_by": value.get("by", "unknown"),
-                "claimed_at": value.get("at", "unknown"),
-                "version": record.version,
+                "held_by": "unknown",
+                "claimed_at": "unknown",
                 "hint": (
-                    "Another agent holds this resource. Work on a "
-                    "different resource, or call agenthold_wait to "
-                    "be notified when it becomes available."
+                    "Another agent claimed this resource but the database "
+                    "is temporarily locked. Work on a different resource, "
+                    "or retry after a short delay."
                 ),
             }
+        value = record.value
+        if self._is_claim_value(value):
+            return self._busy_response(key, value, record.version)
+        return {
+            "status": "busy",
+            "resource": key,
+            "held_by": "unknown",
+            "claimed_at": "unknown",
+            "version": record.version,
+            "hint": (
+                "Another agent holds this resource. Work on a different "
+                "resource, or call agenthold_wait to be notified when it "
+                "becomes available."
+            ),
+        }
 
-        # Unknown status value → treat as unclaimed
-        return self._attempt_claim(
-            key, claim_value, agent, expected_version=record.version
-        )
+    @staticmethod
+    def _busy_response(key: str, value: dict[str, Any], version: int) -> dict[str, Any]:
+        return {
+            "status": "busy",
+            "resource": key,
+            "held_by": value.get("by", "unknown"),
+            "claimed_at": value.get("at", "unknown"),
+            "version": version,
+            "hint": (
+                "Another agent holds this resource. Work on a different "
+                "resource, or call agenthold_wait to be notified when it "
+                "becomes available."
+            ),
+        }
 
-    def release(self, resource: str, agent: str) -> dict[str, Any]:
-        """Release a claim on a resource."""
-        key = self._validate_inputs(resource, agent)
+    # ------------------------------------------------------------------
+    # release
+    # ------------------------------------------------------------------
+
+    def release(
+        self,
+        raw: Any,
+        agent: str,
+        outcome: str = "released",
+        moved_to: Any = None,
+    ) -> dict[str, Any]:
+        """Release a claim with an explicit lifecycle outcome.
+
+        Allowed outcomes: released, modified, created, deleted, moved.
+        For outcome=moved, moved_to must be provided as a resource string;
+        for any other outcome, moved_to must be omitted.
+        """
+        rid = self.canonicalize(raw)
+        _validate_identifier(agent, "agent")
+        key = rid.to_uri()
+
+        # Validate outcome
+        if outcome not in AGENT_OUTCOMES:
+            raise ValueError(
+                f"Invalid outcome {outcome!r}. Allowed: {sorted(AGENT_OUTCOMES)}"
+            )
+
+        # Validate moved_to vs outcome
+        moved_to_uri: str | None = None
+        if outcome == "moved":
+            if moved_to is None:
+                raise ValueError("moved_to is required when outcome='moved'")
+            target_rid = self.canonicalize(moved_to)
+            target_uri = target_rid.to_uri()
+            if target_uri == key:
+                raise ValueError("moved_to must differ from the source resource")
+            moved_to_uri = target_uri
+        else:
+            if moved_to is not None:
+                raise ValueError(
+                    f"moved_to is only allowed with outcome='moved' "
+                    f"(got outcome={outcome!r})"
+                )
+
+        return self._do_release(key, agent, outcome, moved_to_uri)
+
+    def _do_release(
+        self,
+        key: str,
+        agent: str,
+        outcome: str,
+        moved_to_uri: str | None,
+    ) -> dict[str, Any]:
         now = self._now()
-
         try:
             record = self._store.get(self.NAMESPACE, key)
         except NotFoundError:
@@ -261,7 +469,6 @@ class Coordinator:
             raise
 
         value = record.value
-
         if not self._is_claim_value(value):
             return {"status": "not_found", "resource": key}
 
@@ -270,85 +477,107 @@ class Coordinator:
         if status == "free":
             return {"status": "already_free", "resource": key}
 
-        if status == "claimed":
-            if value.get("by") != agent:
+        if status != "claimed":
+            return {"status": "not_found", "resource": key}
+
+        if value.get("by") != agent:
+            return {
+                "status": "error",
+                "message": (f"Resource is claimed by {value.get('by')}, not {agent}"),
+            }
+
+        free_value: dict[str, Any] = {
+            "status": "free",
+            "released_by": agent,
+            "at": now,
+            "outcome": outcome,
+        }
+        if moved_to_uri is not None:
+            free_value["moved_to"] = moved_to_uri
+
+        try:
+            result = self._store.set(
+                self.NAMESPACE,
+                key,
+                free_value,
+                updated_by=agent,
+                expected_version=record.version,
+            )
+        except ConflictError:
+            try:
+                current = self._store.get(self.NAMESPACE, key)
                 return {
                     "status": "error",
                     "message": (
-                        f"Resource is claimed by {value.get('by')}, not {agent}"
+                        "Conflict while releasing. Current state may have changed."
+                    ),
+                    "current_version": current.version,
+                    "current_value": current.value,
+                }
+            except NotFoundError:
+                return {"status": "not_found", "resource": key}
+            except BusyError:
+                return {
+                    "status": "error",
+                    "message": (
+                        "Conflict while releasing and the database is "
+                        "temporarily locked. Retry after a short delay."
                     ),
                 }
 
-            free_value = {
-                "status": "free",
-                "released_by": agent,
-                "at": now,
-            }
-            try:
-                result = self._store.set(
-                    self.NAMESPACE,
-                    key,
-                    free_value,
-                    updated_by=agent,
-                    expected_version=record.version,
-                )
-            except ConflictError:
-                # Should not normally happen — only the holder releases.
-                # Re-read and return diagnostic info.
-                try:
-                    current = self._store.get(self.NAMESPACE, key)
-                    return {
-                        "status": "error",
-                        "message": (
-                            "Conflict while releasing. Current state may have changed."
-                        ),
-                        "current_version": current.version,
-                        "current_value": current.value,
-                    }
-                except NotFoundError:
-                    return {"status": "not_found", "resource": key}
-                except BusyError:
-                    return {
-                        "status": "error",
-                        "message": (
-                            "Conflict while releasing and the database is "
-                            "temporarily locked. Retry after a short delay."
-                        ),
-                    }
-            return {
-                "status": "released",
-                "resource": key,
-                "version": result.version,
-            }
+        response: dict[str, Any] = {
+            "status": "released",
+            "resource": key,
+            "version": result.version,
+            "outcome": outcome,
+        }
+        if moved_to_uri is not None:
+            response["moved_to"] = moved_to_uri
+        return response
 
-        # Unknown status → treat as not claimable
-        return {"status": "not_found", "resource": key}
+    # ------------------------------------------------------------------
+    # status
+    # ------------------------------------------------------------------
 
-    def status(self, resource: str) -> dict[str, Any]:
+    def status(self, raw: Any) -> dict[str, Any]:
         """Check whether a resource is available or claimed."""
-        key = self._validate_inputs(resource)
-        state = self.interpret_state(key)
+        state = self.interpret_state(raw)
+        key = state["resource"]
 
         if state["state"] == "unclaimed":
             return {"status": "available", "resource": key}
 
         if state["state"] == "free":
-            return {
+            outcome = state["outcome"]
+            response: dict[str, Any] = {
                 "status": "available",
                 "resource": key,
-                "last_held_by": state["last_held_by"],
-                "released_at": state["released_at"],
+                "previous_outcome": outcome,
+                "previous_holder": state["released_by"],
+                "previous_outcome_at": state["released_at"],
             }
+            if outcome == "moved" and state.get("moved_to"):
+                response["moved_to"] = state["moved_to"]
+            hint = self._hint_for_outcome(outcome)
+            if hint:
+                response["hint"] = hint
+            return response
 
         if state["state"] == "expired":
-            return {
+            response = {
                 "status": "available",
                 "resource": key,
-                "note": (f"previous claim by {state['held_by']} expired"),
+                "previous_outcome": "expired",
+                "previous_holder": state["held_by"],
+                "previous_outcome_at": state["claimed_at"],
             }
+            hint = self._hint_for_outcome("expired")
+            if hint:
+                response["hint"] = hint
+            return response
 
         # claimed — enrich with agent metadata
-        result: dict[str, Any] = {
+        claimed_response: dict[str, Any] = {
             "status": "claimed",
             "resource": key,
             "held_by": state["held_by"],
@@ -357,9 +586,13 @@ class Coordinator:
         }
         info = self._get_agent_info(state["held_by"])
         if info:
-            result["agent_name"] = info["agent_name"]
-            result["agent_model"] = info["agent_model"]
-        return result
+            claimed_response["agent_name"] = info["agent_name"]
+            claimed_response["agent_model"] = info["agent_model"]
+        return claimed_response
+
+    # ------------------------------------------------------------------
+    # Registration
+    # ------------------------------------------------------------------
 
     def register(
         self,
@@ -418,16 +651,17 @@ class Coordinator:
             pass
 
     def release_all(self, agent_id: str) -> list[str]:
-        """Release all claims held by an agent.
+        """Release all claims held by an agent on disconnect.
 
-        Best-effort: skips claims that can't be released due to
-        conflicts or DB locks. Returns list of released resources.
+        All released claims are marked outcome='abandoned' since the agent
+        did not get a chance to declare a lifecycle outcome explicitly.
         """
         released: list[str] = []
         try:
             records = self._store.list_keys(self.NAMESPACE)
         except BusyError:
             return released
+        now = self._now()
         for record in records:
             value = record.value
             if (
@@ -438,7 +672,8 @@ class Coordinator:
                 free_value = {
                     "status": "free",
                     "released_by": agent_id,
-                    "at": self._now(),
+                    "at": now,
+                    "outcome": "abandoned",
                 }
                 try:
                     self._store.set(
@@ -469,86 +704,3 @@ class Coordinator:
             )
         except (NotFoundError, ConflictError, BusyError):
             pass
-
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
-
-    def _attempt_claim(
-        self,
-        key: str,
-        claim_value: dict[str, str],
-        agent: str,
-        expected_version: int,
-    ) -> dict[str, Any]:
-        """Try to write a claim. On conflict, re-read and return busy."""
-        try:
-            result = self._store.set(
-                self.NAMESPACE,
-                key,
-                claim_value,
-                updated_by=agent,
-                expected_version=expected_version,
-            )
-            return {
-                "status": "claimed",
-                "resource": key,
-                "version": result.version,
-            }
-        except ConflictError:
-            # Another agent won the race. Re-read to get winner's details.
-            try:
-                record = self._store.get(self.NAMESPACE, key)
-                value = record.value
-                if self._is_claim_value(value):
-                    return {
-                        "status": "busy",
-                        "resource": key,
-                        "held_by": value.get("by", "unknown"),
-                        "claimed_at": value.get("at", "unknown"),
-                        "version": record.version,
-                        "hint": (
-                            "Another agent holds this resource. Work on a "
-                            "different resource, or call agenthold_wait to "
-                            "be notified when it becomes available."
-                        ),
-                    }
-                # Winner wrote a non-claim value (mode mixing) — treat as
-                # busy with limited info.
-                return {
-                    "status": "busy",
-                    "resource": key,
-                    "held_by": "unknown",
-                    "claimed_at": "unknown",
-                    "version": record.version,
-                    "hint": (
-                        "Another agent holds this resource. Work on a "
-                        "different resource, or call agenthold_wait to "
-                        "be notified when it becomes available."
-                    ),
-                }
-            except NotFoundError:
-                # Extremely unlikely: winner claimed then deleted between
-                # our conflict and re-read. Treat as available — caller
-                # can retry claim.
-                return {
-                    "status": "error",
-                    "message": (
-                        "Conflict occurred but resource no longer exists. "
-                        "Retry the claim."
-                    ),
-                }
-            except BusyError:
-                # Database locked during re-read after conflict.
-                # We know someone else won, but can't get their details.
-                return {
-                    "status": "busy",
-                    "resource": key,
-                    "held_by": "unknown",
-                    "claimed_at": "unknown",
-                    "hint": (
-                        "Another agent claimed this resource but the "
-                        "database is temporarily locked. Work on a "
-                        "different resource, or retry after a short delay."
-                    ),
-                }

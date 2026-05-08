@@ -115,6 +115,19 @@ When an agent connects, it sees five self-documenting tools: `agenthold_register
 
 ---
 
+## Resources
+
+agenthold identifies resources by canonical URIs. Tools accept either form:
+
+- **Bare path** (e.g. `"src/main.py"`) — resolves against the workspace named `default`, or the only configured workspace if exactly one exists.
+- **Explicit URI** — `"file://<workspace>/<path>"` for files, `"custom://<name>"` for opaque resources.
+
+Equivalent inputs (`./src/main.py`, `src\main.py`, `src//main.py`, an absolute path inside the workspace) all canonicalize to the same internal URI, so two agents using different shorthands never fragment the keyspace. Path traversal (`..`) and dot segments (`.`) are rejected at the boundary.
+
+Configure workspaces with `--workspace name=path` (repeatable). With no flag, agenthold creates a single `default` workspace at the current working directory. Multi-workspace setups let one agenthold process coordinate across separate codebases.
+
+---
+
 ## Tools
 
 agenthold exposes five coordination tools by default.
@@ -148,14 +161,16 @@ Claim exclusive access to a resource before modifying it. Requires a registered 
 
 **Claimed** (you hold exclusive access):
 ```json
-{ "status": "claimed", "resource": "intro.md", "version": 1 }
+{ "status": "claimed", "resource": "file://default/intro.md", "version": 1 }
 ```
+
+If the resource has a non-trivial prior history (deleted, moved, abandoned, or expired), the response also carries `previous_outcome`, `previous_holder`, `previous_outcome_at`, and a `hint` describing what the previous holder did. For `previous_outcome: "moved"`, `moved_to` is the new resource URI.
 
 **Busy** (another agent is working on this resource):
 ```json
 {
   "status": "busy",
-  "resource": "intro.md",
+  "resource": "file://default/intro.md",
   "held_by": "agent-e5f6g7h8",
   "claimed_at": "2026-03-18T10:00:00+00:00",
   "hint": "Another agent holds this resource. Work on a different resource, or call agenthold_wait to be notified when it becomes available."
@@ -164,22 +179,30 @@ Claim exclusive access to a resource before modifying it. Requires a registered 
 
 **Already claimed** (you already hold this claim, idempotent):
 ```json
-{ "status": "already_claimed", "resource": "intro.md", "version": 1 }
+{ "status": "already_claimed", "resource": "file://default/intro.md", "version": 1 }
 ```
 
 ---
 
 ### `agenthold_release`
 
-Release your claim after finishing edits. This immediately notifies any agents waiting via `agenthold_wait`. Requires a registered `agent_id`.
+Release your claim with an explicit outcome describing what you did. The outcome is preserved in the free-state record and shown to the next claimant so they don't act on stale assumptions. Requires a registered `agent_id`.
 
 ```json
-{ "resource": "intro.md", "agent_id": "agent-a1b2c3d4" }
+{
+  "resource": "intro.md",
+  "agent_id": "agent-a1b2c3d4",
+  "outcome": "modified"
+}
 ```
 
 ```json
-{ "status": "released", "resource": "intro.md", "version": 2 }
+{ "status": "released", "resource": "file://default/intro.md", "version": 2, "outcome": "modified" }
 ```
+
+Outcomes: `released` (default — no lifecycle claim), `modified` (changed in place), `created` (didn't exist before), `deleted` (no longer exists at this resource), `moved` (relocated — also pass `moved_to` with the new resource).
+
+For renames (`mv old new`): claim BOTH paths, do the rename on disk, then release the source with `outcome: "moved", moved_to: "new"` and the destination with `outcome: "created"`.
 
 ---
 
@@ -193,14 +216,16 @@ Check whether a resource is available or currently claimed. Does not require reg
 
 **Available:**
 ```json
-{ "status": "available", "resource": "intro.md" }
+{ "status": "available", "resource": "file://default/intro.md" }
 ```
+
+If a previous holder declared a non-trivial outcome (`deleted`, `moved`, `abandoned`, `expired`), the response also includes `previous_outcome`, `previous_holder`, `previous_outcome_at`, and a `hint`. For `moved`, `moved_to` is the new resource URI.
 
 **Claimed:**
 ```json
 {
   "status": "claimed",
-  "resource": "intro.md",
+  "resource": "file://default/intro.md",
   "held_by": "agent-e5f6g7h8",
   "agent_name": "editor-agent",
   "agent_model": "claude-sonnet-4-6",
@@ -221,14 +246,16 @@ Wait for a claimed resource to become available. Blocks the agent turn until the
 
 **Available** (resource was released):
 ```json
-{ "status": "available", "resource": "intro.md", "elapsed_seconds": 2.4 }
+{ "status": "available", "resource": "file://default/intro.md", "elapsed_seconds": 2.4 }
 ```
+
+When the wait fires on a release with a non-trivial outcome, the response also carries `previous_outcome`, `previous_holder`, `previous_outcome_at`, optional `moved_to`, and a `hint`. An agent that was waiting to edit a moved or deleted resource learns *why* the path became available.
 
 **Timeout:**
 ```json
 {
   "status": "timeout",
-  "resource": "intro.md",
+  "resource": "file://default/intro.md",
   "held_by": "writer-2",
   "elapsed_seconds": 30.2,
   "hint": "The resource was not released within the timeout. Try working on a different resource, or call agenthold_wait again with a longer timeout."
@@ -322,13 +349,13 @@ Agent A: agenthold_register(name="writer", model="claude-sonnet-4-6")
          → agent_id: "agent-a1b2c3d4"
 
 Agent A: agenthold_claim(resource="chapter-3.md", agent_id="agent-a1b2c3d4")
-         → status: "claimed"
+         → status: "claimed", resource: "file://default/chapter-3.md"
 
 Agent B: agenthold_claim(resource="chapter-3.md", agent_id="agent-e5f6g7h8")
          → status: "busy", hint: "Work on a different resource..."
 
-Agent A: agenthold_release(resource="chapter-3.md", agent_id="agent-a1b2c3d4")
-         → status: "released"
+Agent A: agenthold_release(resource="chapter-3.md", agent_id="agent-a1b2c3d4", outcome="modified")
+         → status: "released", outcome: "modified"
 ```
 
 No system prompt engineering. The tool descriptions guide the agents.
@@ -356,9 +383,11 @@ uv run python examples/budget_allocation/with_agenthold.py     # exact allocatio
 ## Configuration
 
 ```bash
-agenthold --db ./state.db                      # standard mode (default)
-agenthold --db ./state.db --tools advanced     # advanced mode
-agenthold --db ./state.db --claim-ttl 1800     # standard + 30 min TTL
+agenthold --db ./state.db                              # standard mode (default)
+agenthold --db ./state.db --tools advanced             # advanced mode
+agenthold --db ./state.db --claim-ttl 1800             # standard + 30 min TTL
+agenthold --workspace myproj=/abs/path                 # named workspace
+agenthold --workspace a=/x --workspace b=/y            # multiple workspaces
 ```
 
 | Flag | Default | Description |
@@ -366,6 +395,7 @@ agenthold --db ./state.db --claim-ttl 1800     # standard + 30 min TTL
 | `--db` | `./agenthold.db` | Path to the SQLite database file. Use `:memory:` for an in-process store (testing only; data is lost when the process exits). |
 | `--tools` | `standard` | Tool set: `standard` (register/claim/release/status/wait) or `advanced` (get/set/delete/watch/list/history/clear/export). |
 | `--claim-ttl` | None (no expiry) | Seconds before an inactive agent's claims expire. Only applies in standard mode. When set, claims held by agents whose last activity exceeds this value are treated as expired and can be taken by other agents. |
+| `--workspace` | one workspace named `default` at the current working directory | Configure a workspace as `name=path` (e.g. `myproj=/abs/path`) or as an absolute path (name derived from the basename). Repeatable. Multiple workspaces let one agenthold process coordinate across separate codebases against the same database. Bare paths in tool inputs resolve against the workspace named `default`, or against the only configured workspace if exactly one exists. |
 
 The database file is created automatically on first run. Back it up like any other SQLite file.
 

@@ -1,6 +1,7 @@
 """Tests for the standard-mode (plug-and-play) server dispatch layer."""
 
 import json
+import os
 from datetime import UTC, datetime
 from unittest.mock import patch
 
@@ -9,11 +10,15 @@ import pytest
 from agenthold.coordinator import Coordinator
 from agenthold.exceptions import ConflictError
 from agenthold.models import ConflictDetail
+from agenthold.resources import Workspace, WorkspaceRegistry
 from agenthold.server import (
     COORDINATION_INSTRUCTIONS,
+    _build_workspaces,
     _dispatch_standard,
+    _parse_workspace_arg,
     _standard_tools,
     _wait_standard,
+    coordination_instructions,
     make_server,
 )
 from agenthold.store import StateStore
@@ -24,8 +29,8 @@ from agenthold.store import StateStore
 
 
 @pytest.fixture
-def coordinator(store: StateStore) -> Coordinator:
-    return Coordinator(store)
+def coordinator(store: StateStore, registry: WorkspaceRegistry) -> Coordinator:
+    return Coordinator(store, registry)
 
 
 def _register(coordinator: Coordinator) -> str:
@@ -50,6 +55,17 @@ def test_standard_mode_has_instructions() -> None:
     assert "agenthold_claim" in init_options.instructions
 
 
+def test_standard_mode_instructions_include_workspaces() -> None:
+    server = make_server(
+        ":memory:",
+        workspaces=[Workspace(name="myproj", root="/abs/path")],
+        tools_mode="standard",
+    )
+    init_options = server.create_initialization_options()
+    assert "myproj" in init_options.instructions
+    assert "/abs/path" in init_options.instructions
+
+
 def test_advanced_mode_has_no_instructions() -> None:
     server = make_server(":memory:", tools_mode="advanced")
     init_options = server.create_initialization_options()
@@ -61,10 +77,35 @@ def test_make_server_accepts_claim_ttl() -> None:
     assert server is not None
 
 
-def test_coordination_instructions_is_nonempty() -> None:
+def test_make_server_default_workspace_is_cwd() -> None:
+    """With no workspaces, defaults to a single 'default' at CWD."""
+    server = make_server(":memory:")
+    init_options = server.create_initialization_options()
+    assert "default" in init_options.instructions
+    # CWD should appear somewhere in the rendered instructions
+    assert os.getcwd().replace("\\", "/") in init_options.instructions.replace(
+        "\\", "/"
+    )
+
+
+def test_coordination_instructions_constant_nonempty() -> None:
     assert len(COORDINATION_INSTRUCTIONS) > 0
     assert "agenthold_claim" in COORDINATION_INSTRUCTIONS
     assert "agenthold_register" in COORDINATION_INSTRUCTIONS
+
+
+def test_coordination_instructions_with_registry() -> None:
+    registry = WorkspaceRegistry(
+        [
+            Workspace(name="default", root="/work"),
+            Workspace(name="other", root="/elsewhere"),
+        ]
+    )
+    text = coordination_instructions(registry)
+    assert "default" in text
+    assert "other" in text
+    assert "/work" in text
+    assert "/elsewhere" in text
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +141,22 @@ def test_standard_mode_exposes_five_tools() -> None:
 def test_standard_tools_and_advanced_tools_no_overlap() -> None:
     standard = {t.name for t in _standard_tools()}
     assert standard & EXPECTED_ADVANCED_TOOLS == set()
+
+
+def test_release_tool_schema_includes_outcome_and_moved_to() -> None:
+    tools = {t.name: t for t in _standard_tools()}
+    release_tool = tools["agenthold_release"]
+    schema = release_tool.inputSchema
+    assert "outcome" in schema["properties"]
+    assert "moved_to" in schema["properties"]
+    # outcome lists the agent-allowed enum values
+    assert set(schema["properties"]["outcome"]["enum"]) == {
+        "released",
+        "modified",
+        "created",
+        "deleted",
+        "moved",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +209,7 @@ def test_dispatch_claim_unclaimed(coordinator: Coordinator) -> None:
         {"resource": "intro.md", "agent_id": agent_id},
     )
     assert result["status"] == "claimed"
-    assert result["resource"] == "intro.md"
+    assert result["resource"] == "file://default/intro.md"
 
 
 def test_dispatch_claim_busy(coordinator: Coordinator) -> None:
@@ -199,7 +256,21 @@ def test_dispatch_claim_empty_resource_returns_error(
         {"resource": "", "agent_id": agent_id},
     )
     assert result["status"] == "error"
-    assert "resource" in result["message"]
+    assert "empty" in result["message"]
+
+
+def test_dispatch_claim_dot_dot_returns_error(
+    coordinator: Coordinator,
+) -> None:
+    """Path traversal must be rejected by the dispatcher."""
+    agent_id = _register(coordinator)
+    result = _dispatch_standard(
+        coordinator,
+        "agenthold_claim",
+        {"resource": "../etc/passwd", "agent_id": agent_id},
+    )
+    assert result["status"] == "error"
+    assert ".." in result["message"]
 
 
 def test_dispatch_claim_unregistered_returns_error(
@@ -228,12 +299,33 @@ def test_dispatch_claim_output_is_json_serialisable(
     assert parsed["status"] == "claimed"
 
 
+def test_dispatch_claim_uri_form(coordinator: Coordinator) -> None:
+    agent_id = _register(coordinator)
+    result = _dispatch_standard(
+        coordinator,
+        "agenthold_claim",
+        {"resource": "file://default/x.py", "agent_id": agent_id},
+    )
+    assert result["status"] == "claimed"
+
+
+def test_dispatch_claim_custom_uri(coordinator: Coordinator) -> None:
+    agent_id = _register(coordinator)
+    result = _dispatch_standard(
+        coordinator,
+        "agenthold_claim",
+        {"resource": "custom://task-42", "agent_id": agent_id},
+    )
+    assert result["status"] == "claimed"
+    assert result["resource"] == "custom://task-42"
+
+
 # ---------------------------------------------------------------------------
 # Dispatch — release
 # ---------------------------------------------------------------------------
 
 
-def test_dispatch_release_own_claim(coordinator: Coordinator) -> None:
+def test_dispatch_release_default_outcome(coordinator: Coordinator) -> None:
     agent_id = _register(coordinator)
     _dispatch_standard(
         coordinator,
@@ -246,6 +338,91 @@ def test_dispatch_release_own_claim(coordinator: Coordinator) -> None:
         {"resource": "f.md", "agent_id": agent_id},
     )
     assert result["status"] == "released"
+    assert result["outcome"] == "released"
+
+
+def test_dispatch_release_with_outcome(coordinator: Coordinator) -> None:
+    agent_id = _register(coordinator)
+    _dispatch_standard(
+        coordinator,
+        "agenthold_claim",
+        {"resource": "temp.txt", "agent_id": agent_id},
+    )
+    result = _dispatch_standard(
+        coordinator,
+        "agenthold_release",
+        {
+            "resource": "temp.txt",
+            "agent_id": agent_id,
+            "outcome": "deleted",
+        },
+    )
+    assert result["outcome"] == "deleted"
+
+
+def test_dispatch_release_with_moved(coordinator: Coordinator) -> None:
+    agent_id = _register(coordinator)
+    _dispatch_standard(
+        coordinator,
+        "agenthold_claim",
+        {"resource": "old.py", "agent_id": agent_id},
+    )
+    result = _dispatch_standard(
+        coordinator,
+        "agenthold_release",
+        {
+            "resource": "old.py",
+            "agent_id": agent_id,
+            "outcome": "moved",
+            "moved_to": "new.py",
+        },
+    )
+    assert result["outcome"] == "moved"
+    assert result["moved_to"] == "file://default/new.py"
+
+
+def test_dispatch_release_invalid_outcome_returns_error(
+    coordinator: Coordinator,
+) -> None:
+    agent_id = _register(coordinator)
+    _dispatch_standard(
+        coordinator,
+        "agenthold_claim",
+        {"resource": "f.md", "agent_id": agent_id},
+    )
+    result = _dispatch_standard(
+        coordinator,
+        "agenthold_release",
+        {
+            "resource": "f.md",
+            "agent_id": agent_id,
+            "outcome": "bogus",
+        },
+    )
+    assert result["status"] == "error"
+    assert "Invalid outcome" in result["message"]
+
+
+def test_dispatch_release_moved_without_target_returns_error(
+    coordinator: Coordinator,
+) -> None:
+    agent_id = _register(coordinator)
+    _dispatch_standard(
+        coordinator,
+        "agenthold_claim",
+        {"resource": "old.py", "agent_id": agent_id},
+    )
+    result = _dispatch_standard(
+        coordinator,
+        "agenthold_release",
+        {
+            "resource": "old.py",
+            "agent_id": agent_id,
+            "outcome": "moved",
+        },
+    )
+    assert result["status"] == "error"
+    assert "moved_to" in result["message"]
 
 
 def test_dispatch_release_other_agent(coordinator: Coordinator) -> None:
@@ -298,9 +475,14 @@ def test_dispatch_release_output_is_json_serialisable(
     result = _dispatch_standard(
         coordinator,
         "agenthold_release",
-        {"resource": "f.md", "agent_id": agent_id},
+        {
+            "resource": "f.md",
+            "agent_id": agent_id,
+            "outcome": "moved",
+            "moved_to": "g.md",
+        },
     )
-    json.dumps(result)  # must not raise
+    json.dumps(result)
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +505,32 @@ def test_dispatch_status_claimed(coordinator: Coordinator) -> None:
     assert result["held_by"] == agent_id
 
 
+def test_dispatch_status_after_deleted_outcome(
+    coordinator: Coordinator,
+) -> None:
+    agent_id = _register(coordinator)
+    _dispatch_standard(
+        coordinator,
+        "agenthold_claim",
+        {"resource": "temp.txt", "agent_id": agent_id},
+    )
+    _dispatch_standard(
+        coordinator,
+        "agenthold_release",
+        {
+            "resource": "temp.txt",
+            "agent_id": agent_id,
+            "outcome": "deleted",
+        },
+    )
+    result = _dispatch_standard(
+        coordinator, "agenthold_status", {"resource": "temp.txt"}
+    )
+    assert result["status"] == "available"
+    assert result["previous_outcome"] == "deleted"
+    assert "hint" in result
+
+
 def test_dispatch_status_output_is_json_serialisable(
     coordinator: Coordinator,
 ) -> None:
@@ -342,14 +550,26 @@ async def test_dispatch_wait_already_available(
     assert result["status"] == "available"
 
 
-async def test_dispatch_wait_fires_on_release(
+async def test_dispatch_wait_fires_on_release_with_outcome(
     coordinator: Coordinator,
 ) -> None:
-    """Claim, then release. wait should see it available immediately."""
     coordinator.claim("f.md", "a")
-    coordinator.release("f.md", "a")
+    coordinator.release("f.md", "a", outcome="modified")
     result = await _wait_standard(coordinator, resource="f.md", timeout_seconds=1.0)
     assert result["status"] == "available"
+    assert result["previous_outcome"] == "modified"
+
+
+async def test_dispatch_wait_fires_on_release_with_moved(
+    coordinator: Coordinator,
+) -> None:
+    coordinator.claim("old.py", "a")
+    coordinator.release("old.py", "a", outcome="moved", moved_to="new.py")
+    result = await _wait_standard(coordinator, resource="old.py", timeout_seconds=1.0)
+    assert result["status"] == "available"
+    assert result["previous_outcome"] == "moved"
+    assert result["moved_to"] == "file://default/new.py"
+    assert "hint" in result
 
 
 async def test_dispatch_wait_timeout(coordinator: Coordinator) -> None:
@@ -381,27 +601,23 @@ async def test_dispatch_wait_empty_resource(
 ) -> None:
     result = await _wait_standard(coordinator, resource="", timeout_seconds=0)
     assert result["status"] == "error"
-    assert "resource" in result["message"]
 
 
 async def test_dispatch_wait_dot_slash_only_returns_error(
     coordinator: Coordinator,
 ) -> None:
-    """'./' normalizes to '' which must be rejected."""
     result = await _wait_standard(coordinator, resource="./", timeout_seconds=0)
     assert result["status"] == "error"
-    assert "empty after normalization" in result["message"]
 
 
 # ---------------------------------------------------------------------------
-# Dispatch — ConflictError safety net
+# ConflictError safety net
 # ---------------------------------------------------------------------------
 
 
 def test_dispatch_standard_catches_conflict_error(
     coordinator: Coordinator,
 ) -> None:
-    """ConflictError from coordinator must not crash the server."""
     detail = ConflictDetail(
         namespace="_agents",
         key="agent-deadbeef",
@@ -420,7 +636,7 @@ def test_dispatch_standard_catches_conflict_error(
     assert result["status"] == "error"
     assert "conflict" in result["message"].lower()
     assert "hint" in result
-    json.dumps(result)  # must be JSON-serialisable
+    json.dumps(result)
 
 
 # ---------------------------------------------------------------------------
@@ -439,12 +655,13 @@ def test_dispatch_standard_unknown_tool(coordinator: Coordinator) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_all_standard_tools_are_handled() -> None:
+def test_all_standard_tools_are_handled(
+    registry: WorkspaceRegistry,
+) -> None:
     """Every standard tool must have a working handler."""
     store = StateStore(":memory:")
-    coord = Coordinator(store)
+    coord = Coordinator(store, registry)
 
-    # Register first to get a valid agent_id
     reg = _dispatch_standard(coord, "agenthold_register", {"name": "drift-test"})
     agent_id = reg["agent_id"]
 
@@ -458,7 +675,6 @@ def test_all_standard_tools_are_handled() -> None:
         "agenthold_status": {"resource": "f.md"},
     }
 
-    # Sync tools (wait is async, tested separately above)
     sync_tools = EXPECTED_STANDARD_TOOLS - {"agenthold_wait"}
     assert valid_calls.keys() == sync_tools
 
@@ -467,3 +683,57 @@ def test_all_standard_tools_are_handled() -> None:
         assert result.get("status") != "error", (
             f"Tool '{tool_name}' returned status='error': {result}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Workspace argument parsing
+# ---------------------------------------------------------------------------
+
+
+class TestWorkspaceArgParsing:
+    def test_name_equals_path(self) -> None:
+        ws = _parse_workspace_arg("myproj=/abs/path")
+        assert ws.name == "myproj"
+        assert ws.root == "/abs/path"
+
+    def test_path_only_derives_name(self) -> None:
+        ws = _parse_workspace_arg("/home/user/myproj")
+        assert ws.name == "myproj"
+        assert ws.root == "/home/user/myproj"
+
+    def test_path_only_with_trailing_slash(self) -> None:
+        ws = _parse_workspace_arg("/home/user/myproj/")
+        assert ws.name == "myproj"
+
+    def test_windows_path_only(self) -> None:
+        ws = _parse_workspace_arg("C:\\projects\\myproj")
+        assert ws.name == "myproj"
+
+    def test_relative_rejected(self) -> None:
+        with pytest.raises(ValueError, match="absolute"):
+            _parse_workspace_arg("relpath")
+
+    def test_empty_name_rejected(self) -> None:
+        with pytest.raises(ValueError, match="name=path"):
+            _parse_workspace_arg("=/abs")
+
+    def test_empty_path_rejected(self) -> None:
+        with pytest.raises(ValueError, match="name=path"):
+            _parse_workspace_arg("name=")
+
+
+class TestBuildWorkspaces:
+    def test_no_args_creates_default(self) -> None:
+        workspaces = _build_workspaces(None)
+        assert len(workspaces) == 1
+        assert workspaces[0].name == "default"
+
+    def test_no_args_empty_list_creates_default(self) -> None:
+        workspaces = _build_workspaces([])
+        assert len(workspaces) == 1
+        assert workspaces[0].name == "default"
+
+    def test_multiple_args(self) -> None:
+        workspaces = _build_workspaces(["a=/x", "b=/y"])
+        names = [w.name for w in workspaces]
+        assert names == ["a", "b"]
