@@ -60,8 +60,11 @@ jobs:
           exit 1
 
       - name: Install mcp-publisher
+        # Use releases/latest — the registry binds the OIDC audience to the
+        # deployment URL (PR modelcontextprotocol/registry#1229), so older
+        # mcp-publisher binaries fail with `invalid audience` errors.
         run: |
-          curl -L "https://github.com/modelcontextprotocol/registry/releases/download/v1.5.0/mcp-publisher_linux_amd64.tar.gz" \
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" \
             | tar -xz mcp-publisher
           chmod +x mcp-publisher
 
