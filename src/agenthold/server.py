@@ -1245,8 +1245,14 @@ async def _run_server(  # pragma: no cover
 def _cleanup_agents(  # pragma: no cover
     coordinator: Coordinator,
 ) -> None:
-    """Release claims and deactivate agents on disconnect."""
-    for agent_id in list(coordinator._registered_agents):
+    """Release claims and deactivate agents on disconnect.
+
+    Scoped to agents registered through this Coordinator's process via
+    session_agent_ids. Agents recognized via DB fallback (registered by
+    other processes) are intentionally NOT cleaned up here — only their
+    owning process should.
+    """
+    for agent_id in coordinator.session_agent_ids:
         coordinator.release_all(agent_id)
         coordinator.deactivate_agent(agent_id)
 

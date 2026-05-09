@@ -87,7 +87,13 @@ class Coordinator:
         self._store = store
         self._registry = registry
         self._claim_ttl = claim_ttl
+        # Recognition cache: agents this Coordinator has seen, either via
+        # register() in this process or via DB fallback in is_registered().
         self._registered_agents: set[str] = set()
+        # Session set: agents this Coordinator's register() created during
+        # this process lifetime. Used by _cleanup_agents to scope cleanup
+        # so we never release/deactivate agents owned by other processes.
+        self._session_agents: set[str] = set()
 
     # ------------------------------------------------------------------
     # Helpers
@@ -622,7 +628,7 @@ class Coordinator:
             updated_by=agent_id,
             expected_version=0,
         )
-        self._registered_agents.add(agent_id)
+        self._track_registration(agent_id)
         return {
             "status": "registered",
             "agent_id": agent_id,
@@ -630,9 +636,51 @@ class Coordinator:
             "registered_at": now,
         }
 
+    def _track_registration(self, agent_id: str) -> None:
+        """Add agent_id to both the recognition cache and the session set.
+
+        Encapsulated so future maintenance cannot insert work between the
+        two .add() calls and silently break the cleanup contract that
+        _cleanup_agents iterates the same set register() populates.
+        """
+        self._registered_agents.add(agent_id)
+        self._session_agents.add(agent_id)
+
+    @property
+    def session_agent_ids(self) -> tuple[str, ...]:
+        """Snapshot of agent IDs registered through this Coordinator.
+
+        Returns a tuple — immutable, safe to iterate while another thread
+        calls register(). Used by server._cleanup_agents to scope the
+        disconnect cleanup to agents this process owns.
+        """
+        return tuple(self._session_agents)
+
     def is_registered(self, agent_id: str) -> bool:
-        """Check if an agent_id was registered on this coordinator."""
-        return agent_id in self._registered_agents
+        """Check whether an agent_id is recognized.
+
+        Fast path: in-memory cache. Slow path: lookup in the _agents
+        namespace. Found agents are added to the recognition cache so
+        subsequent calls skip the DB. Agents discovered via the slow
+        path are NOT added to _session_agents — recognition is not the
+        same as session ownership.
+
+        Returns False on BusyError (DB temporarily locked). The store's
+        5-second busy_timeout normally clears transient locks before this
+        call returns; if it does not, the agent sees "Unknown agent_id"
+        and may retry the original tool call.
+        """
+        if agent_id in self._registered_agents:
+            return True
+        try:
+            record = self._store.get(self.AGENTS_NAMESPACE, agent_id)
+        except (NotFoundError, BusyError):
+            return False
+        value = record.value
+        if isinstance(value, dict) and value.get("status") == "active":
+            self._registered_agents.add(agent_id)
+            return True
+        return False
 
     def refresh_agent(self, agent_id: str) -> None:
         """Update last_activity for an agent. Best-effort."""

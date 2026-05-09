@@ -3,6 +3,7 @@
 import json
 import threading
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -553,6 +554,126 @@ class TestRegister:
     def test_register_json_serialisable(self, coordinator: Coordinator) -> None:
         result = coordinator.register("test-agent")
         json.dumps(result)
+
+
+# ---------------------------------------------------------------------------
+# Durable registration  (DB-backed is_registered + session scoping)
+# ---------------------------------------------------------------------------
+
+
+class TestDurableRegistration:
+    """Tests for the cross-process / cross-coordinator registration story.
+
+    These exercise the failure modes documented in
+    plan/durable-agent-registration.md: a Coordinator must recognize
+    agents that were registered against the same DB by another
+    Coordinator (post-restart, multi-process, or out-of-process CLI),
+    but cleanup must remain scoped to agents this Coordinator's own
+    register() created.
+    """
+
+    def _file_coord(self, db_path: Path, registry: WorkspaceRegistry) -> Coordinator:
+        return Coordinator(StateStore(db_path), registry)
+
+    def test_register_tracks_agent_in_both_sets(self, coordinator: Coordinator) -> None:
+        result = coordinator.register("test-agent")
+        agent_id = result["agent_id"]
+        assert agent_id in coordinator._registered_agents
+        assert agent_id in coordinator._session_agents
+        assert agent_id in coordinator.session_agent_ids
+
+    def test_is_registered_db_fallback_recognizes_agent_from_other_coordinator(
+        self, tmp_path: Path, registry: WorkspaceRegistry
+    ) -> None:
+        db_path = tmp_path / "shared.db"
+        coord_a = self._file_coord(db_path, registry)
+        agent_id = coord_a.register("from-a")["agent_id"]
+
+        coord_b = self._file_coord(db_path, registry)
+        assert coord_b.is_registered(agent_id) is True
+
+        coord_a._store.close()
+        coord_b._store.close()
+
+    def test_db_fallback_does_not_pollute_session_agents(
+        self, tmp_path: Path, registry: WorkspaceRegistry
+    ) -> None:
+        db_path = tmp_path / "shared.db"
+        coord_a = self._file_coord(db_path, registry)
+        agent_id = coord_a.register("from-a")["agent_id"]
+
+        coord_b = self._file_coord(db_path, registry)
+        assert coord_b.is_registered(agent_id) is True
+        # Recognition cache filled, session set untouched.
+        assert agent_id in coord_b._registered_agents
+        assert agent_id not in coord_b._session_agents
+        assert coord_b.session_agent_ids == ()
+
+        coord_a._store.close()
+        coord_b._store.close()
+
+    def test_is_registered_caches_db_fallback_result(
+        self, tmp_path: Path, registry: WorkspaceRegistry
+    ) -> None:
+        db_path = tmp_path / "shared.db"
+        coord_a = self._file_coord(db_path, registry)
+        agent_id = coord_a.register("from-a")["agent_id"]
+
+        coord_b = self._file_coord(db_path, registry)
+        with patch.object(coord_b._store, "get", wraps=coord_b._store.get) as spy:
+            assert coord_b.is_registered(agent_id) is True
+            assert spy.call_count == 1
+            # Second call hits the cache; no further DB read.
+            assert coord_b.is_registered(agent_id) is True
+            assert spy.call_count == 1
+
+        coord_a._store.close()
+        coord_b._store.close()
+
+    def test_is_registered_rejects_inactive_agent_via_db(
+        self, tmp_path: Path, registry: WorkspaceRegistry
+    ) -> None:
+        db_path = tmp_path / "shared.db"
+        coord_a = self._file_coord(db_path, registry)
+        agent_id = coord_a.register("from-a")["agent_id"]
+        coord_a.deactivate_agent(agent_id)
+
+        coord_b = self._file_coord(db_path, registry)
+        assert coord_b.is_registered(agent_id) is False
+        # Inactive agents must not pollute either set.
+        assert agent_id not in coord_b._registered_agents
+        assert agent_id not in coord_b._session_agents
+
+        coord_a._store.close()
+        coord_b._store.close()
+
+    def test_is_registered_returns_false_on_busy_error(
+        self, coordinator: Coordinator
+    ) -> None:
+        with patch.object(coordinator._store, "get", side_effect=BusyError()):
+            assert coordinator.is_registered("agent-unknown") is False
+        # Cache and session set untouched by a failed lookup.
+        assert "agent-unknown" not in coordinator._registered_agents
+        assert "agent-unknown" not in coordinator._session_agents
+
+    def test_is_registered_unknown_agent_returns_false(
+        self, coordinator: Coordinator
+    ) -> None:
+        assert coordinator.is_registered("agent-nonexistent") is False
+        assert "agent-nonexistent" not in coordinator._registered_agents
+        assert "agent-nonexistent" not in coordinator._session_agents
+
+    def test_session_agent_ids_returns_snapshot_tuple(
+        self, coordinator: Coordinator
+    ) -> None:
+        a = coordinator.register("a")["agent_id"]
+        b = coordinator.register("b")["agent_id"]
+        snap = coordinator.session_agent_ids
+        assert isinstance(snap, tuple)
+        assert set(snap) == {a, b}
+        # Snapshot is independent of subsequent mutation.
+        coordinator._session_agents.discard(a)
+        assert set(snap) == {a, b}
 
 
 # ---------------------------------------------------------------------------
