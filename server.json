@@ -3,7 +3,7 @@
   "name": "io.github.edobusy/agenthold",
   "title": "agenthold",
   "description": "Shared versioned state for multi-agent AI workflows",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "repository": {
     "url": "https://github.com/edobusy/agenthold",
     "source": "github"
@@ -28,7 +28,7 @@
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "agenthold",
-      "version": "0.5.1",
+      "version": "0.6.0",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"
@@ -49,6 +49,28 @@
           "isRequired": false,
           "default": "./agenthold.db",
           "format": "filepath"
+        },
+        {
+          "type": "named",
+          "name": "--transport",
+          "description": "Transport to serve on: 'stdio' (default; one local subprocess per agent) or 'http' (one long-lived server many agents connect to over Streamable HTTP).",
+          "isRequired": false,
+          "default": "stdio",
+          "choices": ["stdio", "http"]
+        },
+        {
+          "type": "named",
+          "name": "--host",
+          "description": "HTTP bind address (default 127.0.0.1). Only used with --transport http.",
+          "isRequired": false,
+          "default": "127.0.0.1"
+        },
+        {
+          "type": "named",
+          "name": "--port",
+          "description": "HTTP port (default 8417). Only used with --transport http.",
+          "isRequired": false,
+          "default": "8417"
         }
       ]
     }
