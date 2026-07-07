@@ -45,6 +45,7 @@ import asyncio
 import hmac
 import json
 import os
+import sqlite3
 import sys
 import time
 from collections.abc import AsyncIterator
@@ -224,7 +225,9 @@ def _standard_tools() -> list[Tool]:
                 "The returned agent_id is your identity for this session "
                 "— use it in all subsequent agenthold_claim and "
                 "agenthold_release calls. "
-                "Do not call this more than once per session."
+                "Do not call this more than once per session. "
+                "If the response status is 'unavailable', the database was "
+                "briefly locked — retry after a short delay."
             ),
             inputSchema={
                 "type": "object",
@@ -268,9 +271,12 @@ def _standard_tools() -> list[Tool]:
                 "read the `hint` to decide how to proceed. "
                 '"already_claimed": You already hold this claim. Safe to '
                 "proceed. "
-                '"busy": Another agent is working on this resource. Do NOT '
-                "modify it. Work on a different resource, or call "
-                "agenthold_wait to be notified when it becomes available."
+                '"busy": Another agent is working on this resource (see '
+                "`held_by`). Do NOT modify it. Work on a different resource, or "
+                "call agenthold_wait to be notified when it becomes available. "
+                '"unavailable": The database was briefly locked (transient) — '
+                "this is NOT another agent holding the resource; retry the same "
+                "call after a short delay (read the `hint`)."
             ),
             inputSchema={
                 "type": "object",
@@ -304,8 +310,9 @@ def _standard_tools() -> list[Tool]:
                 "needed. "
                 '"not_found": The resource was never claimed. No action '
                 "needed. "
-                '"error": You tried to release a resource claimed by a '
-                "different agent."
+                '"error": You do not hold this claim (`held_by` names who '
+                "does), or a transient conflict occurred while releasing — read "
+                "the `hint`: if it says to retry, re-read status and retry."
             ),
             inputSchema={
                 "type": "object",
@@ -334,7 +341,9 @@ def _standard_tools() -> list[Tool]:
                 "holder did something significant (deleted, moved, etc.). "
                 "Call agenthold_claim to secure it before editing. "
                 '"claimed": Another agent holds this resource. The '
-                "response tells you who and when."
+                "response tells you who and when. "
+                '"unavailable": The database was briefly locked (transient); '
+                "retry after a short delay."
             ),
             inputSchema={
                 "type": "object",
@@ -1008,10 +1017,13 @@ def _dispatch_standard(
     try:
         return _dispatch_standard_tool(coordinator, name, args)
     except BusyError:
+        # 'unavailable' (not 'busy'): a transient DB lock, NOT a peer holding
+        # the resource. 'busy' means another agent holds the claim; do not
+        # conflate them, or an agent will abandon a resource it should retry.
         return {
-            "status": "busy",
+            "status": "unavailable",
             "message": "Database temporarily locked. Retry after a short delay.",
-            "hint": "Retry after a short delay.",
+            "hint": "Transient lock — retry the same call after a short delay.",
         }
     except ConflictError as e:
         return {
@@ -1226,10 +1238,12 @@ def _dispatch(store: StateStore, name: str, args: dict[str, Any]) -> dict[str, A
     try:
         return _dispatch_tool(store, name, args)
     except BusyError:
+        # 'unavailable' = transient DB lock (retry); distinct from any
+        # coordination status. Advanced tools have no 'busy' meaning of their own.
         return {
-            "status": "busy",
+            "status": "unavailable",
             "message": ("The database is temporarily locked by another writer."),
-            "hint": "Retry the operation after a short delay.",
+            "hint": "Transient lock — retry the operation after a short delay.",
         }
     except ValueError as e:
         return {"status": "error", "message": str(e)}
@@ -1583,7 +1597,9 @@ async def _run_http(  # pragma: no cover
     registry = WorkspaceRegistry(workspaces)
     store = StateStore(db_path)
     coordinator = Coordinator(store, registry, claim_ttl=claim_ttl)
-    if not _is_loopback_host(host) and not allowed_hosts and not auth_tokens:
+    # Gate on auth only: --allowed-host is DNS-rebinding protection, NOT
+    # authentication, so it must not silence the "no auth" exposure warning.
+    if not _is_loopback_host(host) and not auth_tokens:
         print(
             f"WARNING: agenthold HTTP is binding to {host!r}, which is reachable "
             "beyond this machine. The HTTP transport has no authentication: "
@@ -1755,46 +1771,87 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _validate_config_or_exit(args: argparse.Namespace) -> list[Workspace]:
+    """Build and validate config, mapping failures to a clean 'error: …' exit.
+
+    Factored out of the pragma-no-cover main() so config validation is testable.
+    Turns the ValueErrors from bad --workspace values, duplicate/invalid
+    workspace names, and a non-positive --claim-ttl into SystemExit (exit 1)
+    instead of a raw traceback.
+    """
+    try:
+        workspaces = _build_workspaces(args.workspace)
+        WorkspaceRegistry(workspaces)  # validates names, uniqueness, roots
+        if args.claim_ttl is not None and not args.claim_ttl > 0:
+            raise ValueError("claim_ttl must be a positive number")
+    except ValueError as e:
+        raise SystemExit(f"error: {e}") from e
+    return workspaces
+
+
+def _http_only_flags_active(args: argparse.Namespace) -> bool:
+    """True if any HTTP-only flag was set to a non-default value."""
+    parser = _build_arg_parser()
+    return (
+        args.host != parser.get_default("host")
+        or args.port != parser.get_default("port")
+        or args.path != parser.get_default("path")
+        or bool(args.json_response)
+        or args.allowed_host is not None
+    )
+
+
 def main() -> None:  # pragma: no cover
     args = _build_arg_parser().parse_args()
     if getattr(args, "command", None) is not None:
         raise SystemExit(inspector.run(args))
-    workspaces = _build_workspaces(args.workspace)
+    workspaces = _validate_config_or_exit(args)
     env_token = os.environ.get(_AUTH_ENV_VAR)
     auth_requested = bool(args.auth_token) or env_token is not None
     auth_tokens = _collect_auth_tokens(args.auth_token, env_token)
-    if args.transport == "http":
-        auth_tokens = _resolve_http_auth(auth_requested, auth_tokens)
-        asyncio.run(
-            _run_http(
-                args.db,
-                workspaces=workspaces,
-                tools_mode=args.tools,
-                claim_ttl=args.claim_ttl,
-                host=args.host,
-                port=args.port,
-                path=args.path,
-                json_response=args.json_response,
-                allowed_hosts=args.allowed_host,
-                auth_tokens=auth_tokens,
+    try:
+        if args.transport == "http":
+            auth_tokens = _resolve_http_auth(auth_requested, auth_tokens)
+            asyncio.run(
+                _run_http(
+                    args.db,
+                    workspaces=workspaces,
+                    tools_mode=args.tools,
+                    claim_ttl=args.claim_ttl,
+                    host=args.host,
+                    port=args.port,
+                    path=args.path,
+                    json_response=args.json_response,
+                    allowed_hosts=args.allowed_host,
+                    auth_tokens=auth_tokens,
+                )
             )
-        )
-    else:
-        if auth_tokens:
-            print(
-                "WARNING: --auth-token / "
-                f"{_AUTH_ENV_VAR} is ignored with --transport stdio "
-                "(stdio is a local, trusted transport with no network surface).",
-                file=sys.stderr,
+        else:
+            if auth_tokens:
+                print(
+                    "WARNING: --auth-token / "
+                    f"{_AUTH_ENV_VAR} is ignored with --transport stdio "
+                    "(stdio is a local, trusted transport with no network "
+                    "surface).",
+                    file=sys.stderr,
+                )
+            if _http_only_flags_active(args):
+                print(
+                    "WARNING: --host/--port/--path/--json-response/--allowed-host "
+                    "only apply to --transport http and are ignored under stdio.",
+                    file=sys.stderr,
+                )
+            asyncio.run(
+                _run_server(
+                    args.db,
+                    workspaces=workspaces,
+                    tools_mode=args.tools,
+                    claim_ttl=args.claim_ttl,
+                )
             )
-        asyncio.run(
-            _run_server(
-                args.db,
-                workspaces=workspaces,
-                tools_mode=args.tools,
-                claim_ttl=args.claim_ttl,
-            )
-        )
+    except (sqlite3.Error, OSError) as e:
+        # e.g. --db points at an unwritable/nonexistent directory.
+        raise SystemExit(f"error: {e}") from e
 
 
 if __name__ == "__main__":  # pragma: no cover

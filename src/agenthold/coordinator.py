@@ -82,8 +82,10 @@ class Coordinator:
         registry: WorkspaceRegistry,
         claim_ttl: float | None = None,
     ) -> None:
-        if claim_ttl is not None and claim_ttl < 0:
-            raise ValueError("claim_ttl must be >= 0")
+        if claim_ttl is not None and not claim_ttl > 0:
+            # Rejects 0 (every claim instantly reclaimable), negatives, and NaN
+            # (NaN > 0 is False, so `not (NaN > 0)` is True).
+            raise ValueError("claim_ttl must be a positive number")
         self._store = store
         self._registry = registry
         self._claim_ttl = claim_ttl
@@ -371,30 +373,29 @@ class Coordinator:
                 ),
             }
         except BusyError:
+            # We know a conflict happened but can't read who holds it (lock).
+            # 'unavailable' (retry), not 'busy' — 'busy' always names held_by.
             return {
-                "status": "busy",
+                "status": "unavailable",
                 "resource": key,
-                "held_by": "unknown",
-                "claimed_at": "unknown",
                 "hint": (
-                    "Another agent claimed this resource but the database "
-                    "is temporarily locked. Work on a different resource, "
-                    "or retry after a short delay."
+                    "A conflict occurred but the database is temporarily "
+                    "locked; retry the claim after a short delay to get a "
+                    "definitive result."
                 ),
             }
         value = record.value
         if self._is_claim_value(value):
             return self._busy_response(key, value, record.version)
+        # Conflict, but the current value is not a well-formed claim (no known
+        # holder) — retry rather than report a holderless 'busy'.
         return {
-            "status": "busy",
+            "status": "unavailable",
             "resource": key,
-            "held_by": "unknown",
-            "claimed_at": "unknown",
             "version": record.version,
             "hint": (
-                "Another agent holds this resource. Work on a different "
-                "resource, or call agenthold_wait to be notified when it "
-                "becomes available."
+                "A conflict occurred and the current state is unexpected; "
+                "retry the claim to get a definitive result."
             ),
         }
 
@@ -490,6 +491,11 @@ class Coordinator:
             return {
                 "status": "error",
                 "message": (f"Resource is claimed by {value.get('by')}, not {agent}"),
+                "held_by": value.get("by"),
+                "hint": (
+                    "You do not hold this claim; only the holder can release it. "
+                    "Do not retry with your agent_id."
+                ),
             }
 
         free_value: dict[str, Any] = {
@@ -519,16 +525,22 @@ class Coordinator:
                     ),
                     "current_version": current.version,
                     "current_value": current.value,
+                    "hint": (
+                        "Transient conflict — re-read status and retry the release."
+                    ),
                 }
             except NotFoundError:
                 return {"status": "not_found", "resource": key}
             except BusyError:
+                # Conflict, then the re-read was DB-locked: transient, retry.
                 return {
-                    "status": "error",
+                    "status": "unavailable",
+                    "resource": key,
                     "message": (
                         "Conflict while releasing and the database is "
-                        "temporarily locked. Retry after a short delay."
+                        "temporarily locked."
                     ),
+                    "hint": "Transient — re-read status and retry the release.",
                 }
 
         response: dict[str, Any] = {

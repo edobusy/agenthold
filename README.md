@@ -124,6 +124,8 @@ agenthold identifies resources by canonical URIs. Tools accept either form:
 
 Equivalent inputs (`./src/main.py`, `src\main.py`, `src//main.py`, an absolute path inside the workspace) all canonicalize to the same internal URI, so two agents using different shorthands never fragment the keyspace. Path traversal (`..`) and dot segments (`.`) are rejected at the boundary.
 
+On case-insensitive filesystems (Windows and macOS by default), file resources are matched case-insensitively, so `src/Main.py` and `src/main.py` resolve to the same resource — two agents can't both claim the same physical file. This follows the running platform; `custom://` names are always case-sensitive.
+
 Configure workspaces with `--workspace name=path` (repeatable). With no flag, agenthold creates a single `default` workspace at the current working directory. Multi-workspace setups let one agenthold process coordinate across separate codebases.
 
 ---
@@ -478,7 +480,8 @@ than serving without auth.
 > The default bind address is `127.0.0.1` (localhost only); binding beyond
 > localhost **without** `--auth-token` prints a startup warning. Pass
 > `--allowed-host <host>` (repeatable) to enable DNS-rebinding (Host-header)
-> protection.
+> protection — note this is **not** authentication and does not replace
+> `--auth-token`.
 
 > **Long-lived servers.** agenthold does not yet reap idle agent records, so a
 > server that runs for a very long time with high agent churn will accumulate

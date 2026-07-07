@@ -595,3 +595,97 @@ def test_export_namespace_total_history_entries_returned(
     _, entries = store.export_namespace("ns")
     total = sum(len(history) for _, history in entries)
     assert total == 5
+
+
+# ---------------------------------------------------------------------------
+# event_type migration (pre-#5 hardening)
+# ---------------------------------------------------------------------------
+
+
+def test_migration_adds_event_type_to_pre_column_db(tmp_path: object) -> None:
+    """Opening an old DB whose state_history lacks event_type must add the
+    column via the PRAGMA-guarded migration (not swallow a lock as 'migrated')."""
+    import sqlite3
+
+    db = str(tmp_path / "old.db")  # type: ignore[operator]
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE state_records (
+            namespace TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
+            version INTEGER NOT NULL, updated_by TEXT NOT NULL,
+            updated_at TEXT NOT NULL, PRIMARY KEY (namespace, key));
+        CREATE TABLE state_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, namespace TEXT NOT NULL,
+            key TEXT NOT NULL, value TEXT NOT NULL, version INTEGER NOT NULL,
+            updated_by TEXT NOT NULL, updated_at TEXT NOT NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = StateStore(db)
+    cols = {r["name"] for r in store._conn.execute("PRAGMA table_info(state_history)")}
+    assert "event_type" in cols
+    # And it actually works end to end (writes + delete tombstones).
+    store.set("ns", "k", "v", updated_by="a", expected_version=0)
+    store.delete("ns", "k", deleted_by="a", expected_version=1)
+    events = {h.event_type for h in store.history("ns", "k", limit=10)}
+    assert events == {"write", "delete"}
+    store.close()
+
+    # Re-opening is a no-op (idempotent) — the ALTER must not run again.
+    again = StateStore(db)
+    again.close()
+
+
+def test_migration_no_op_on_current_db(store: StateStore) -> None:
+    # A freshly created DB already has event_type; running the migration again
+    # must be a harmless no-op.
+    store._migrate_event_type()
+    cols = {r["name"] for r in store._conn.execute("PRAGMA table_info(state_history)")}
+    assert "event_type" in cols
+
+
+class _ExecInterceptor:
+    """Wraps a sqlite3 connection so a callback can intercept execute()."""
+
+    def __init__(self, conn: object, intercept: object) -> None:
+        self._conn = conn
+        self._intercept = intercept
+
+    def execute(self, sql: str, *args: object) -> object:
+        return self._intercept(sql, self._conn.execute, *args)  # type: ignore[attr-defined]
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._conn, name)
+
+
+def test_migration_swallows_duplicate_column_race(store: StateStore) -> None:
+    """When two processes migrate one old DB at once, the losing ALTER hits
+    'duplicate column name' — it must be swallowed, not crash. Forced here by
+    making the PRAGMA report the column absent so the ALTER runs against the
+    already-present column."""
+
+    def intercept(sql: str, real, *args):  # type: ignore[no-untyped-def]
+        if "table_info" in sql:
+            return iter([])
+        return real(sql, *args)
+
+    store._conn = _ExecInterceptor(store._conn, intercept)  # type: ignore[assignment]
+    store._migrate_event_type()  # must not raise
+
+
+def test_migration_reraises_non_duplicate_error(store: StateStore) -> None:
+    import sqlite3
+
+    def intercept(sql: str, real, *args):  # type: ignore[no-untyped-def]
+        if "table_info" in sql:
+            return iter([])
+        if sql.strip().upper().startswith("ALTER"):
+            raise sqlite3.OperationalError("database is locked")
+        return real(sql, *args)
+
+    store._conn = _ExecInterceptor(store._conn, intercept)  # type: ignore[assignment]
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        store._migrate_event_type()

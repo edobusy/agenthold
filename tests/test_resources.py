@@ -237,11 +237,49 @@ class TestBareRelativePath:
         with pytest.raises(ValueError, match="string"):
             parse_resource_input(123, default_registry)  # type: ignore[arg-type]
 
-    def test_case_sensitive(self, default_registry: WorkspaceRegistry) -> None:
-        """Different case = different resource (per design)."""
-        a = parse_resource_input("src/Main.py", default_registry)
-        b = parse_resource_input("src/main.py", default_registry)
+    def test_case_sensitive_workspace_distinguishes_case(self) -> None:
+        reg = WorkspaceRegistry(
+            [Workspace(name="default", root="/proj", case_sensitive=True)]
+        )
+        a = parse_resource_input("src/Main.py", reg)
+        b = parse_resource_input("src/main.py", reg)
         assert a.path != b.path
+
+    def test_case_insensitive_workspace_folds_case(self) -> None:
+        # On a case-insensitive FS, 'Main.py' and 'main.py' are the same file
+        # and must not be independently claimable.
+        reg = WorkspaceRegistry(
+            [Workspace(name="default", root="/proj", case_sensitive=False)]
+        )
+        keys = {
+            parse_resource_input(p, reg).to_uri()
+            for p in ("src/Main.py", "src/main.py", "src/MAIN.PY")
+        }
+        assert keys == {"file://default/src/main.py"}
+
+    def test_case_insensitive_does_not_fold_custom(self) -> None:
+        reg = WorkspaceRegistry(
+            [Workspace(name="default", root="/proj", case_sensitive=False)]
+        )
+        # custom names are opaque identifiers, not filesystem paths.
+        assert parse_resource_input("custom://Foo", reg).to_uri() == "custom://Foo"
+
+    def test_case_insensitive_absolute_root_case_mismatch(self) -> None:
+        reg = WorkspaceRegistry(
+            [Workspace(name="default", root="/proj", case_sensitive=False)]
+        )
+        # Differing case in the absolute path/root still resolves + folds.
+        rid = parse_resource_input("/PROJ/Src/App.py", reg)
+        assert rid.to_uri() == "file://default/src/app.py"
+
+    def test_case_insensitive_root_with_length_changing_fold(self) -> None:
+        # 'ß' casefolds to 'ss' (length change): the remainder must still be
+        # sliced correctly (regression guard for the longest_match offset).
+        reg = WorkspaceRegistry(
+            [Workspace(name="w", root="/proß", case_sensitive=False)]
+        )
+        rid = parse_resource_input("/PROSS/sub/x.py", reg)
+        assert rid.to_uri() == "file://w/sub/x.py"
 
 
 class TestBareRelativeNoDefault:

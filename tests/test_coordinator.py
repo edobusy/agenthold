@@ -482,9 +482,11 @@ class TestBusyErrorInConflictRecovery:
         ):
             result = coordinator.claim("intro.md", "agent-a")
 
-        assert result["status"] == "busy"
+        # A lock during conflict re-read can't name a holder → 'unavailable'
+        # (retry), not a holderless 'busy'.
+        assert result["status"] == "unavailable"
         assert result["resource"] == "file://default/intro.md"
-        assert result["held_by"] == "unknown"
+        assert "held_by" not in result
         assert "temporarily locked" in result["hint"]
         json.dumps(result)
 
@@ -510,8 +512,10 @@ class TestBusyErrorInConflictRecovery:
         ):
             result = coordinator.release("intro.md", "agent-a")
 
-        assert result["status"] == "error"
+        # Conflict then a locked re-read is transient → 'unavailable' + hint.
+        assert result["status"] == "unavailable"
         assert "temporarily locked" in result["message"]
+        assert "hint" in result
         json.dumps(result)
 
 
@@ -774,14 +778,22 @@ class TestClaimTTLInit:
     def test_negative_ttl_raises(
         self, store: StateStore, registry: WorkspaceRegistry
     ) -> None:
-        with pytest.raises(ValueError, match="claim_ttl must be >= 0"):
+        with pytest.raises(ValueError, match="claim_ttl must be a positive"):
             Coordinator(store, registry, claim_ttl=-1.0)
 
-    def test_zero_ttl_allowed(
+    def test_zero_ttl_raises(
         self, store: StateStore, registry: WorkspaceRegistry
     ) -> None:
-        coord = Coordinator(store, registry, claim_ttl=0.0)
-        assert coord._claim_ttl == 0.0
+        # 0 would make every claim instantly reclaimable — reject it.
+        with pytest.raises(ValueError, match="claim_ttl must be a positive"):
+            Coordinator(store, registry, claim_ttl=0.0)
+
+    def test_nan_ttl_raises(
+        self, store: StateStore, registry: WorkspaceRegistry
+    ) -> None:
+        # NaN <= 0 is False, so a naive check would accept it (never-expiring).
+        with pytest.raises(ValueError, match="claim_ttl must be a positive"):
+            Coordinator(store, registry, claim_ttl=float("nan"))
 
     def test_none_ttl_allowed(
         self, store: StateStore, registry: WorkspaceRegistry

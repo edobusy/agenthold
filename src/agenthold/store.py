@@ -132,14 +132,34 @@ class StateStore:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
-        # Migration: add event_type to databases that predate this column.
+        self._migrate_event_type()
+
+    def _migrate_event_type(self) -> None:
+        """Add the event_type column to state_history if it predates that column.
+
+        The PRAGMA check skips the ALTER when the column already exists, so a
+        steady-state open is a no-op. The ALTER is still wrapped to catch ONLY
+        the "duplicate column name" race — when several processes sharing one DB
+        file migrate an old database at once, exactly one ALTER wins and the
+        losers must not crash. Any other error (e.g. a real lock that outlasts
+        busy_timeout) is re-raised rather than silently mistaken for 'migrated',
+        which would leave the column missing and break every later write.
+        """
+        columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(state_history)")
+        }
+        if "event_type" in columns:
+            return
         try:
             self._conn.execute(
                 "ALTER TABLE state_history "
                 "ADD COLUMN event_type TEXT NOT NULL DEFAULT 'write'"
             )
-        except sqlite3.OperationalError:
-            pass  # Column already exists — db already migrated or just created
+        except sqlite3.OperationalError as e:
+            # Another process added the column between our check and ALTER.
+            if "duplicate column name" not in str(e):
+                raise
 
     @contextmanager
     def _transaction(self) -> Generator[sqlite3.Connection, None, None]:

@@ -1,6 +1,6 @@
 """Agenthold : shared versioned state for multi-agent AI workflows."""
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 from agenthold.coordinator import Coordinator
 from agenthold.exceptions import BusyError, ConflictError, NotFoundError
