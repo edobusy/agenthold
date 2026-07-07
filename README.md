@@ -403,6 +403,7 @@ agenthold --transport http --port 8417                 # serve over HTTP (see be
 | `--path` | `/mcp` | HTTP endpoint path the MCP transport is mounted at. Only used with `--transport http`. |
 | `--json-response` | off | Return JSON responses instead of SSE streams over HTTP. Only used with `--transport http`. |
 | `--allowed-host` | none | Enable DNS-rebinding protection and allow this `Host` header value. Repeatable. When omitted, protection stays disabled (localhost-friendly). Only used with `--transport http`. |
+| `--auth-token` | none | Require this bearer token on every HTTP request (`Authorization: Bearer <token>`). Repeatable. Also settable via the `AGENTHOLD_AUTH_TOKEN` env var (comma-separated), which is preferred. Only used with `--transport http`. |
 
 The database file is created automatically on first run. Back it up like any other SQLite file.
 
@@ -438,12 +439,41 @@ identically over HTTP — only the transport changes. Because a single server no
 serves many agents over its lifetime, set `--claim-ttl` so a claim held by an
 agent that disconnects is automatically reclaimable.
 
-> **Security.** The HTTP transport has **no authentication yet**. The default
-> bind address is `127.0.0.1` (localhost only). Do not expose it on a public
-> interface without putting your own authentication in front of it. Pass
+### Authentication
+
+To require a bearer token on every HTTP request, set one or more tokens. Prefer
+the environment variable so the token doesn't appear in process listings:
+
+```bash
+AGENTHOLD_AUTH_TOKEN=s3cr3t agenthold --db ./state.db --transport http --host 0.0.0.0
+# or, less privately:
+agenthold --transport http --auth-token s3cr3t --auth-token another-token
+```
+
+Clients then send the token in the `Authorization` header:
+
+```json
+{
+  "mcpServers": {
+    "agenthold": {
+      "url": "http://your-host:8417/mcp",
+      "headers": { "Authorization": "Bearer s3cr3t" }
+    }
+  }
+}
+```
+
+Requests without a valid token are rejected with `401` before reaching the store.
+Tokens are compared in constant time. Authentication applies to `--transport
+http` only (stdio is a trusted local transport). This release is all-or-nothing
+authentication; per-namespace scoping is on the roadmap.
+
+> **Security.** Bearer tokens are only as private as the transport carrying them
+> — put **TLS** in front of agenthold (a reverse proxy) for any real deployment.
+> The default bind address is `127.0.0.1` (localhost only); binding beyond
+> localhost **without** `--auth-token` prints a startup warning. Pass
 > `--allowed-host <host>` (repeatable) to enable DNS-rebinding (Host-header)
-> protection when binding beyond localhost. Binding to a non-loopback address
-> prints a startup warning.
+> protection.
 
 > **Long-lived servers.** agenthold does not yet reap idle agent records, so a
 > server that runs for a very long time with high agent churn will accumulate
@@ -528,7 +558,7 @@ Locks require the holder to release them, which means the system must handle cra
 Each key has a version that starts at 1 and increments by exactly 1 on every write. The `state_history` table is append-only and records every write before the live record is updated, so a crash between the two writes leaves history consistent. Deletions also write a tombstone entry to `state_history` (with `event_type: "delete"`) before removing the live record, so the full lifecycle of a key is visible in history. The ordering guarantee is per-key, not global; two different keys can have their versions updated in any order.
 
 **What would change for production scale:**
-Two things. First, replace SQLite with Postgres: better concurrent write throughput, replication, and managed hosting. The `StateStore` interface is already designed to make this a contained change. Second, add authentication: the HTTP transport (see [HTTP transport](#http-transport)) currently trusts any caller that can reach the port, so a production deployment needs at minimum an API key check in front of it. The network transport itself already exists — agenthold serves Streamable HTTP via the MCP SDK's `StreamableHTTPSessionManager`, letting remote agents connect over the network instead of requiring a local process.
+Mainly one thing: replace SQLite with Postgres for better concurrent write throughput, replication, and managed hosting. The `StateStore` interface is already designed to make this a contained change. The network transport and authentication already exist — agenthold serves Streamable HTTP via the MCP SDK's `StreamableHTTPSessionManager` (so remote agents connect over the network instead of a local process), and `--auth-token` gates access with a bearer token (see [Authentication](#authentication)). Put TLS in front via a reverse proxy for production, and note that per-namespace/tenant scoping of tokens is not yet implemented.
 
 </details>
 

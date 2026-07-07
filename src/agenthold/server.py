@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hmac
 import json
 import os
 import sys
@@ -803,6 +804,85 @@ class _StreamableHTTPASGIApp:
         await self._manager.handle_request(scope, receive, send)
 
 
+_AUTH_ENV_VAR = "AGENTHOLD_AUTH_TOKEN"
+
+
+def _collect_auth_tokens(
+    cli_tokens: list[str] | None, env_value: str | None
+) -> frozenset[str]:
+    """Merge bearer tokens from --auth-token and AGENTHOLD_AUTH_TOKEN.
+
+    The env var is a comma-separated list. Blank/whitespace-only tokens are
+    dropped so a misconfiguration (e.g. a stray comma or --auth-token "") can
+    never create an empty-string credential that would authorize everyone.
+    """
+    tokens: set[str] = set()
+    for token in cli_tokens or []:
+        if token.strip():
+            tokens.add(token)
+    if env_value:
+        for token in env_value.split(","):
+            if token.strip():
+                tokens.add(token)
+    return frozenset(tokens)
+
+
+class _BearerAuthASGIApp:
+    """ASGI gate that requires a valid ``Authorization: Bearer <token>``.
+
+    Wraps the Streamable-HTTP endpoint so an unauthenticated request is rejected
+    with 401 before it ever reaches the MCP session manager or the store.
+    """
+
+    _SCHEME = b"bearer "  # RFC 7235: the auth scheme is case-insensitive.
+
+    def __init__(self, inner: _StreamableHTTPASGIApp, tokens: frozenset[str]) -> None:
+        self._inner = inner
+        # Compare as bytes: hmac.compare_digest raises TypeError on non-ASCII
+        # str, and a raw Authorization header can contain arbitrary bytes.
+        self._token_bytes = frozenset(token.encode() for token in tokens)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and not self._authorized(scope):
+            await self._reject(send)
+            return
+        await self._inner(scope, receive, send)
+
+    def _authorized(self, scope: Scope) -> bool:
+        raw = b""
+        for name, value in scope.get("headers", []):
+            if name == b"authorization":
+                raw = value
+                break
+        prefix_len = len(self._SCHEME)
+        if raw[:prefix_len].lower() != self._SCHEME:
+            return False
+        presented = raw[prefix_len:]
+        # Constant-time comparison against every configured token; comparing all
+        # of them keeps timing from leaking which (if any) token matched.
+        return any(hmac.compare_digest(presented, token) for token in self._token_bytes)
+
+    @staticmethod
+    async def _reject(send: Send) -> None:
+        body = json.dumps(
+            {
+                "error": "unauthorized",
+                "message": "Provide a valid 'Authorization: Bearer <token>' header.",
+            }
+        ).encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 401,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"www-authenticate", b"Bearer"),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+
 def _is_loopback_host(host: str) -> bool:
     """True if the bind address only reaches the local machine."""
     return host in {"127.0.0.1", "localhost", "::1"}
@@ -834,6 +914,7 @@ def build_http_app(
     path: str = "/mcp",
     json_response: bool = False,
     security_settings: TransportSecuritySettings | None = None,
+    auth_tokens: frozenset[str] | None = None,
 ) -> Starlette:
     """Build a Starlette ASGI app serving agenthold over Streamable HTTP.
 
@@ -845,6 +926,10 @@ def build_http_app(
 
     ``path`` is normalized to a leading slash so that a bare value such as
     ``"mcp"`` is accepted rather than raising deep inside Starlette routing.
+
+    When ``auth_tokens`` is non-empty, every request must present a matching
+    ``Authorization: Bearer <token>`` header or it is rejected with 401 before
+    reaching the session manager.
     """
     if not path.startswith("/"):
         path = "/" + path
@@ -855,6 +940,11 @@ def build_http_app(
         stateless=False,
         security_settings=security_settings,
     )
+
+    inner = _StreamableHTTPASGIApp(manager)
+    endpoint: _StreamableHTTPASGIApp | _BearerAuthASGIApp = inner
+    if auth_tokens:
+        endpoint = _BearerAuthASGIApp(inner, auth_tokens)
 
     @asynccontextmanager
     async def lifespan(_app: Starlette) -> AsyncIterator[None]:
@@ -868,7 +958,7 @@ def build_http_app(
                 _cleanup_agents(coordinator)
 
     return Starlette(
-        routes=[Route(path, endpoint=_StreamableHTTPASGIApp(manager))],
+        routes=[Route(path, endpoint=endpoint)],
         lifespan=lifespan,
     )
 
@@ -1366,17 +1456,19 @@ async def _run_http(  # pragma: no cover
     path: str = "/mcp",
     json_response: bool = False,
     allowed_hosts: list[str] | None = None,
+    auth_tokens: frozenset[str] | None = None,
 ) -> None:
     registry = WorkspaceRegistry(workspaces)
     store = StateStore(db_path)
     coordinator = Coordinator(store, registry, claim_ttl=claim_ttl)
-    if not _is_loopback_host(host) and not allowed_hosts:
+    if not _is_loopback_host(host) and not allowed_hosts and not auth_tokens:
         print(
             f"WARNING: agenthold HTTP is binding to {host!r}, which is reachable "
             "beyond this machine. The HTTP transport has no authentication: "
             "anyone who can reach this address can read and write coordination "
-            "state. Restrict access at the network layer, and pass --allowed-host "
-            "to enable DNS-rebinding protection.",
+            "state. Pass --auth-token to require a bearer token, restrict access "
+            "at the network layer, and pass --allowed-host to enable DNS-rebinding "
+            "protection.",
             file=sys.stderr,
         )
     app = build_http_app(
@@ -1387,6 +1479,7 @@ async def _run_http(  # pragma: no cover
         path=path,
         json_response=json_response,
         security_settings=_security_settings_from_allowed_hosts(allowed_hosts),
+        auth_tokens=auth_tokens,
     )
     config = uvicorn.Config(
         app,
@@ -1520,6 +1613,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "(localhost-friendly default). Only used with --transport http."
         ),
     )
+    parser.add_argument(
+        "--auth-token",
+        action="append",
+        default=None,
+        dest="auth_token",
+        help=(
+            "Require this bearer token on every HTTP request "
+            "(Authorization: Bearer <token>). Repeatable. Tokens may also be "
+            f"supplied via the {_AUTH_ENV_VAR} env var (comma-separated), which "
+            "is preferred so the token is not visible in process listings. "
+            "Only used with --transport http; ignored for stdio."
+        ),
+    )
     # Read-only inspector subcommands. A bare invocation (no subcommand) leaves
     # command=None and runs the MCP server, preserving backward compatibility.
     subparsers = parser.add_subparsers(dest="command")
@@ -1532,6 +1638,7 @@ def main() -> None:  # pragma: no cover
     if getattr(args, "command", None) is not None:
         raise SystemExit(inspector.run(args))
     workspaces = _build_workspaces(args.workspace)
+    auth_tokens = _collect_auth_tokens(args.auth_token, os.environ.get(_AUTH_ENV_VAR))
     if args.transport == "http":
         asyncio.run(
             _run_http(
@@ -1544,9 +1651,17 @@ def main() -> None:  # pragma: no cover
                 path=args.path,
                 json_response=args.json_response,
                 allowed_hosts=args.allowed_host,
+                auth_tokens=auth_tokens,
             )
         )
     else:
+        if auth_tokens:
+            print(
+                "WARNING: --auth-token / "
+                f"{_AUTH_ENV_VAR} is ignored with --transport stdio "
+                "(stdio is a local, trusted transport with no network surface).",
+                file=sys.stderr,
+            )
         asyncio.run(
             _run_server(
                 args.db,

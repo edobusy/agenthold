@@ -7,6 +7,40 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.8.0] - 2026-07-07
+
+### Added
+- **Bearer-token authentication for the HTTP transport.** The HTTP transport
+  previously trusted anyone who could reach the port; it can now require a
+  bearer token, making it safe to expose beyond localhost.
+  - Configure tokens with `--auth-token TOKEN` (repeatable) or the
+    `AGENTHOLD_AUTH_TOKEN` env var (comma-separated). The env var is preferred so
+    the token is not visible in process listings.
+  - When any token is configured, every HTTP request must carry a matching
+    `Authorization: Bearer <token>` header or it is rejected with `401`
+    (`WWW-Authenticate: Bearer`) **before** reaching the MCP session manager or
+    the store. Tokens are compared in constant time (`hmac.compare_digest`); the
+    scheme is matched case-insensitively per RFC 7235.
+  - Blank/whitespace-only tokens are dropped, so a misconfiguration cannot create
+    an empty-string credential that authorizes everyone.
+  - Auth applies to `--transport http` only. Supplying a token with
+    `--transport stdio` prints a warning and is otherwise ignored (stdio is a
+    local, trusted transport with no network surface).
+
+### Changed
+- The non-loopback bind warning now recommends `--auth-token` and is suppressed
+  when authentication is configured.
+
+### Security
+- Terminate TLS at a reverse proxy in front of agenthold: bearer tokens are only
+  as private as the transport carrying them. Binding beyond localhost without
+  `--auth-token` remains discouraged (and warns).
+- Per-namespace / scoped authorization (a token limited to specific namespaces)
+  is **not** included; this release is all-or-nothing authentication. Scoped
+  authorization is a tracked roadmap follow-up.
+
+---
+
 ## [0.7.0] - 2026-07-07
 
 ### Added
