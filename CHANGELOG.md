@@ -7,6 +7,34 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.6.0] - 2026-07-07
+
+### Added
+- **HTTP (Streamable HTTP) transport**: agenthold can now serve over the network
+  as a single long-lived process that many agents connect to, instead of each
+  agent spawning its own local stdio subprocess. This is the adoption unlock for
+  distributed multi-agent setups (separate containers, hosts, cloud workers) —
+  stdio coordination only works between agents on one machine sharing a SQLite
+  file. Enable with `--transport http`. New flags (all HTTP-only): `--host`
+  (default `127.0.0.1`), `--port` (default `8417`), `--path` (default `/mcp`),
+  `--json-response`, and `--allowed-host` (repeatable; opts into DNS-rebinding
+  protection). stdio remains the default — existing configs are unchanged.
+  - Built on the MCP SDK's `StreamableHTTPSessionManager` mounted in a Starlette
+    app served by uvicorn (both already required transitively by `mcp`, now
+    declared explicitly). The low-level MCP `Server`, all tool schemas, the
+    coordinator, and the store are reused verbatim — only the transport differs.
+  - On server shutdown, standard-mode agent claims are released (mirroring the
+    stdio cleanup path). Because an HTTP server is long-lived and serves many
+    agents over time, `--claim-ttl` is recommended in HTTP deployments so stale
+    claims from disconnected agents recover automatically.
+
+### Security
+- The HTTP transport ships without authentication (a future release). The safe
+  default binds to `127.0.0.1`; exposing beyond localhost without auth is not
+  recommended. `--allowed-host` enables Host-header (DNS-rebinding) protection.
+
+---
+
 ## [0.5.1] - 2026-05-08
 
 ### Fixed

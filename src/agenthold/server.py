@@ -35,6 +35,7 @@ Usage:
   agenthold --workspace a=/x --workspace b=/y      # multiple workspaces
   agenthold --tools advanced                       # advanced mode
   agenthold --claim-ttl 1800                       # standard + 30 min TTL
+  agenthold --transport http --port 8417           # serve over Streamable HTTP
 """
 
 from __future__ import annotations
@@ -44,12 +45,20 @@ import asyncio
 import json
 import os
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+import uvicorn
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import TextContent, Tool
+from starlette.applications import Starlette
+from starlette.routing import Route
+from starlette.types import Receive, Scope, Send
 
 from agenthold.coordinator import Coordinator
 from agenthold.exceptions import BusyError, ConflictError, NotFoundError
@@ -726,15 +735,13 @@ def _make_server_from_parts(
         server = Server("agenthold")
 
     @server.list_tools()  # type: ignore[no-untyped-call, untyped-decorator]
-    async def list_tools() -> list[Tool]:  # pragma: no cover
+    async def list_tools() -> list[Tool]:
         if tools_mode == "advanced":
             return _advanced_tools()
         return _standard_tools()
 
     @server.call_tool()  # type: ignore[untyped-decorator]
-    async def call_tool(  # pragma: no cover
-        name: str, arguments: dict[str, Any]
-    ) -> list[TextContent]:
+    async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         if tools_mode == "advanced":
             if name == "agenthold_watch":
                 result = await _watch(
@@ -758,6 +765,84 @@ def _make_server_from_parts(
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
     return server
+
+
+# ---------------------------------------------------------------------------
+# HTTP (Streamable HTTP) transport
+# ---------------------------------------------------------------------------
+
+
+class _StreamableHTTPASGIApp:
+    """ASGI wrapper around the session manager's request handler.
+
+    Passed to a Starlette ``Route`` as the endpoint. A class instance (rather
+    than a bound method) is required so Starlette treats it as a raw ASGI app
+    and matches the path exactly — a bound method would be wrapped as a
+    request/response endpoint and trigger a trailing-slash redirect on every
+    request.
+    """
+
+    def __init__(self, manager: StreamableHTTPSessionManager) -> None:
+        self._manager = manager
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        await self._manager.handle_request(scope, receive, send)
+
+
+def _security_settings_from_allowed_hosts(
+    allowed_hosts: list[str] | None,
+) -> TransportSecuritySettings | None:
+    """Build DNS-rebinding protection settings, or None to leave it disabled.
+
+    Passing None to the transport disables DNS-rebinding protection (the SDK's
+    backward-compatible default), so out-of-the-box localhost clients are not
+    rejected. Supplying at least one allowed host opts into protection.
+    """
+    if not allowed_hosts:
+        return None
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=list(allowed_hosts),
+    )
+
+
+def build_http_app(
+    store: StateStore,
+    coordinator: Coordinator,
+    registry: WorkspaceRegistry,
+    tools_mode: str = "standard",
+    *,
+    path: str = "/mcp",
+    json_response: bool = False,
+    security_settings: TransportSecuritySettings | None = None,
+) -> Starlette:
+    """Build a Starlette ASGI app serving agenthold over Streamable HTTP.
+
+    The MCP server is the same low-level Server used for stdio; only the
+    transport differs. A StreamableHTTPSessionManager tracks one MCP session
+    per connected client. The session manager's task group is established by
+    the app's lifespan; on shutdown, standard-mode agent claims are released
+    (mirroring the stdio cleanup path).
+    """
+    server = _make_server_from_parts(store, coordinator, registry, tools_mode)
+    manager = StreamableHTTPSessionManager(
+        server,
+        json_response=json_response,
+        stateless=False,
+        security_settings=security_settings,
+    )
+
+    @asynccontextmanager
+    async def lifespan(_app: Starlette) -> AsyncIterator[None]:
+        async with manager.run():
+            yield
+        if tools_mode == "standard":
+            _cleanup_agents(coordinator)
+
+    return Starlette(
+        routes=[Route(path, endpoint=_StreamableHTTPASGIApp(manager))],
+        lifespan=lifespan,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1242,6 +1327,34 @@ async def _run_server(  # pragma: no cover
                 _cleanup_agents(coordinator)
 
 
+async def _run_http(  # pragma: no cover
+    db_path: str | Path,
+    workspaces: list[Workspace],
+    tools_mode: str = "standard",
+    claim_ttl: float | None = None,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8417,
+    path: str = "/mcp",
+    json_response: bool = False,
+    allowed_hosts: list[str] | None = None,
+) -> None:
+    registry = WorkspaceRegistry(workspaces)
+    store = StateStore(db_path)
+    coordinator = Coordinator(store, registry, claim_ttl=claim_ttl)
+    app = build_http_app(
+        store,
+        coordinator,
+        registry,
+        tools_mode,
+        path=path,
+        json_response=json_response,
+        security_settings=_security_settings_from_allowed_hosts(allowed_hosts),
+    )
+    config = uvicorn.Config(app, host=host, port=port, log_level="info")
+    await uvicorn.Server(config).serve()
+
+
 def _cleanup_agents(  # pragma: no cover
     coordinator: Coordinator,
 ) -> None:
@@ -1257,7 +1370,12 @@ def _cleanup_agents(  # pragma: no cover
         coordinator.deactivate_agent(agent_id)
 
 
-def main() -> None:  # pragma: no cover
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """Construct the CLI argument parser.
+
+    Factored out of main() so argument parsing is unit-testable without
+    spawning a server.
+    """
     parser = argparse.ArgumentParser(description="Agenthold MCP server")
     parser.add_argument(
         "--db",
@@ -1279,7 +1397,9 @@ def main() -> None:  # pragma: no cover
         default=None,
         help=(
             "Seconds before an inactive agent's claims expire "
-            "(default: no expiry). Only applies in standard mode."
+            "(default: no expiry). Only applies in standard mode. "
+            "Recommended when using --transport http, where the server is "
+            "long-lived and serves many agents over time."
         ),
     )
     parser.add_argument(
@@ -1293,16 +1413,87 @@ def main() -> None:  # pragma: no cover
             "created at the current working directory."
         ),
     )
-    args = parser.parse_args()
-    workspaces = _build_workspaces(args.workspace)
-    asyncio.run(
-        _run_server(
-            args.db,
-            workspaces=workspaces,
-            tools_mode=args.tools,
-            claim_ttl=args.claim_ttl,
-        )
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "http"],
+        default="stdio",
+        help=(
+            "Transport to serve on: 'stdio' (default; one local subprocess per "
+            "agent) or 'http' (a single long-lived server that many agents "
+            "connect to over Streamable HTTP)."
+        ),
     )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help=(
+            "HTTP bind address (default: 127.0.0.1). Only used with "
+            "--transport http. Binding beyond localhost exposes agenthold with "
+            "no authentication — not recommended."
+        ),
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8417,
+        help="HTTP port (default: 8417). Only used with --transport http.",
+    )
+    parser.add_argument(
+        "--path",
+        default="/mcp",
+        help=(
+            "HTTP endpoint path the MCP transport is mounted at "
+            "(default: /mcp). Only used with --transport http."
+        ),
+    )
+    parser.add_argument(
+        "--json-response",
+        action="store_true",
+        help=(
+            "Return JSON responses instead of SSE streams over HTTP. "
+            "Only used with --transport http."
+        ),
+    )
+    parser.add_argument(
+        "--allowed-host",
+        action="append",
+        default=None,
+        dest="allowed_host",
+        help=(
+            "Enable DNS-rebinding protection and allow this Host header value. "
+            "Repeatable. When omitted, protection stays disabled "
+            "(localhost-friendly default). Only used with --transport http."
+        ),
+    )
+    return parser
+
+
+def main() -> None:  # pragma: no cover
+    args = _build_arg_parser().parse_args()
+    workspaces = _build_workspaces(args.workspace)
+    if args.transport == "http":
+        asyncio.run(
+            _run_http(
+                args.db,
+                workspaces=workspaces,
+                tools_mode=args.tools,
+                claim_ttl=args.claim_ttl,
+                host=args.host,
+                port=args.port,
+                path=args.path,
+                json_response=args.json_response,
+                allowed_hosts=args.allowed_host,
+            )
+        )
+    else:
+        asyncio.run(
+            _run_server(
+                args.db,
+                workspaces=workspaces,
+                tools_mode=args.tools,
+                claim_ttl=args.claim_ttl,
+            )
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

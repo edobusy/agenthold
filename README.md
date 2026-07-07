@@ -388,16 +388,61 @@ agenthold --db ./state.db --tools advanced             # advanced mode
 agenthold --db ./state.db --claim-ttl 1800             # standard + 30 min TTL
 agenthold --workspace myproj=/abs/path                 # named workspace
 agenthold --workspace a=/x --workspace b=/y            # multiple workspaces
+agenthold --transport http --port 8417                 # serve over HTTP (see below)
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `--db` | `./agenthold.db` | Path to the SQLite database file. Use `:memory:` for an in-process store (testing only; data is lost when the process exits). |
 | `--tools` | `standard` | Tool set: `standard` (register/claim/release/status/wait) or `advanced` (get/set/delete/watch/list/history/clear/export). |
-| `--claim-ttl` | None (no expiry) | Seconds before an inactive agent's claims expire. Only applies in standard mode. When set, claims held by agents whose last activity exceeds this value are treated as expired and can be taken by other agents. |
+| `--claim-ttl` | None (no expiry) | Seconds before an inactive agent's claims expire. Only applies in standard mode. When set, claims held by agents whose last activity exceeds this value are treated as expired and can be taken by other agents. Recommended with `--transport http`. |
 | `--workspace` | one workspace named `default` at the current working directory | Configure a workspace as `name=path` (e.g. `myproj=/abs/path`) or as an absolute path (name derived from the basename). Repeatable. Multiple workspaces let one agenthold process coordinate across separate codebases against the same database. Bare paths in tool inputs resolve against the workspace named `default`, or against the only configured workspace if exactly one exists. |
+| `--transport` | `stdio` | `stdio` (one local subprocess per agent) or `http` (one long-lived server many agents connect to over Streamable HTTP). |
+| `--host` | `127.0.0.1` | HTTP bind address. Only used with `--transport http`. |
+| `--port` | `8417` | HTTP port. Only used with `--transport http`. |
+| `--path` | `/mcp` | HTTP endpoint path the MCP transport is mounted at. Only used with `--transport http`. |
+| `--json-response` | off | Return JSON responses instead of SSE streams over HTTP. Only used with `--transport http`. |
+| `--allowed-host` | none | Enable DNS-rebinding protection and allow this `Host` header value. Repeatable. When omitted, protection stays disabled (localhost-friendly). Only used with `--transport http`. |
 
 The database file is created automatically on first run. Back it up like any other SQLite file.
+
+### HTTP transport
+
+By default agenthold speaks **stdio**: your MCP client spawns one agenthold
+subprocess per agent, and those subprocesses coordinate through the shared
+SQLite file on the same machine. That is perfect for local, single-machine
+multi-agent runs.
+
+To coordinate agents that live in **different processes, containers, or hosts**,
+run one long-lived agenthold server over **Streamable HTTP** and point every
+agent at it:
+
+```bash
+agenthold --db ./state.db --transport http --host 127.0.0.1 --port 8417 --claim-ttl 1800
+```
+
+Then connect MCP clients by URL instead of by command:
+
+```json
+{
+  "mcpServers": {
+    "agenthold": {
+      "url": "http://127.0.0.1:8417/mcp"
+    }
+  }
+}
+```
+
+All five standard tools (and the advanced set, with `--tools advanced`) work
+identically over HTTP — only the transport changes. Because a single server now
+serves many agents over its lifetime, set `--claim-ttl` so a claim held by an
+agent that disconnects is automatically reclaimable.
+
+> **Security.** The HTTP transport has **no authentication yet**. The default
+> bind address is `127.0.0.1` (localhost only). Do not expose it on a public
+> interface without putting your own authentication in front of it. Pass
+> `--allowed-host <host>` (repeatable) to enable DNS-rebinding (Host-header)
+> protection when binding beyond localhost.
 
 ---
 
@@ -443,7 +488,7 @@ Locks require the holder to release them, which means the system must handle cra
 Each key has a version that starts at 1 and increments by exactly 1 on every write. The `state_history` table is append-only and records every write before the live record is updated, so a crash between the two writes leaves history consistent. Deletions also write a tombstone entry to `state_history` (with `event_type: "delete"`) before removing the live record, so the full lifecycle of a key is visible in history. The ordering guarantee is per-key, not global; two different keys can have their versions updated in any order.
 
 **What would change for production scale:**
-Three things. First, replace SQLite with Postgres: better concurrent write throughput, replication, and managed hosting. The `StateStore` interface is already designed to make this a contained change. Second, add authentication: the current server trusts any caller on the stdio transport. A production deployment needs at minimum an API key check. Third, add the HTTP transport: the MCP SDK supports `StreamableHTTPServer`, which would let remote agents connect over the network instead of requiring a local process.
+Two things. First, replace SQLite with Postgres: better concurrent write throughput, replication, and managed hosting. The `StateStore` interface is already designed to make this a contained change. Second, add authentication: the HTTP transport (see [HTTP transport](#http-transport)) currently trusts any caller that can reach the port, so a production deployment needs at minimum an API key check in front of it. The network transport itself already exists — agenthold serves Streamable HTTP via the MCP SDK's `StreamableHTTPSessionManager`, letting remote agents connect over the network instead of requiring a local process.
 
 </details>
 
