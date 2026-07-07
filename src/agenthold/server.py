@@ -66,6 +66,7 @@ from starlette.types import Receive, Scope, Send
 from agenthold import inspector
 from agenthold.coordinator import Coordinator
 from agenthold.exceptions import BusyError, ConflictError, NotFoundError
+from agenthold.notifier import KeyNotifier
 from agenthold.resources import (
     DEFAULT_WORKSPACE_NAME,
     Workspace,
@@ -661,9 +662,12 @@ def _advanced_tools() -> list[Tool]:
             name="agenthold_watch",
             description=(
                 "Wait for a key's version to change, then return the new value. "
-                "Polls every 200 ms. Returns when version exceeds since_version, "
-                'or returns {"status": "timeout"} with a hint if nothing changed '
-                "within timeout_seconds. "
+                "Returns as soon as a set on this key raises its version above "
+                "since_version — near-instantly when the writer is on the same "
+                "server, and within ~200 ms otherwise (a bounded fallback check "
+                "for changes made by other processes). Returns "
+                '{"status": "timeout"} with a hint if nothing changed within '
+                "timeout_seconds. "
                 "IMPORTANT: This call holds the agent turn until it returns — no "
                 "other actions can be taken while waiting. Only use this when the "
                 "agent has nothing else to do until the key changes. "
@@ -694,8 +698,8 @@ def _advanced_tools() -> list[Tool]:
                             "Maximum seconds to wait (default 10). "
                             "Pass a larger value if the writing agent may take "
                             "longer. 0 returns immediately after one check. "
-                            "Actual wait may exceed this by up to 200ms due "
-                            "to the polling interval."
+                            "On timeout the actual wait may exceed this by up to "
+                            "the ~200 ms fallback interval."
                         ),
                     },
                 },
@@ -738,6 +742,9 @@ def _make_server_from_parts(
     else:
         server = Server("agenthold")
 
+    # One notifier per process, shared across all sessions this server handles.
+    notifier = KeyNotifier()
+
     @server.list_tools()  # type: ignore[no-untyped-call, untyped-decorator]
     async def list_tools() -> list[Tool]:
         if tools_mode == "advanced":
@@ -761,22 +768,26 @@ def _make_server_from_parts(
                     key=arguments["key"],
                     since_version=int(arguments["since_version"]),
                     timeout_seconds=float(arguments.get("timeout_seconds", 10.0)),
+                    notifier=notifier,
                 )
             else:
                 result = await anyio.to_thread.run_sync(
                     _dispatch, store, name, arguments
                 )
+                _notify_after_write(notifier, name, arguments, result)
         else:
             if name == "agenthold_wait":
                 result = await _wait_standard(
                     coordinator,
                     resource=arguments["resource"],
                     timeout_seconds=float(arguments.get("timeout_seconds", 30.0)),
+                    notifier=notifier,
                 )
             else:
                 result = await anyio.to_thread.run_sync(
                     _dispatch_standard, coordinator, name, arguments
                 )
+                _notify_after_standard(notifier, coordinator, name, arguments, result)
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
     return server
@@ -1055,12 +1066,73 @@ def _dispatch_standard_tool(
     return {"status": "error", "message": f"Unknown tool: {name}"}
 
 
+# ---------------------------------------------------------------------------
+# Notification helpers (event-based wake for watch/wait)
+# ---------------------------------------------------------------------------
+
+# Fallback poll cadence, unchanged from the pre-notification loop. Same-process
+# changes wake waiters instantly via the notifier; this bounds the latency for
+# cross-process / un-notified changes so there is no regression versus polling.
+_POLL_INTERVAL = 0.2
+
+
+def _watch_key(namespace: str, key: str) -> str:
+    return f"kv:{namespace}\x00{key}"
+
+
+def _wait_key(uri: str) -> str:
+    return f"claim:{uri}"
+
+
+def _notify_after_write(
+    notifier: KeyNotifier, name: str, args: dict[str, Any], result: dict[str, Any]
+) -> None:
+    """Wake watchers after a successful advanced-mode write (a version bump)."""
+    if name == "agenthold_set" and result.get("status") == "ok":
+        notifier.notify(_watch_key(args["namespace"], args["key"]))
+
+
+def _notify_after_standard(
+    notifier: KeyNotifier,
+    coordinator: Coordinator,
+    name: str,
+    args: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    """Wake waiters after a release frees a resource."""
+    if name == "agenthold_release" and result.get("status") == "released":
+        try:
+            uri = coordinator.canonicalize(args["resource"]).to_uri()
+        except ValueError:
+            return
+        notifier.notify(_wait_key(uri))
+
+
+async def _wait_for_notify(fut: asyncio.Future[None], timeout: float) -> None:
+    """Await a notification or the fallback interval, whichever comes first."""
+    try:
+        await asyncio.wait_for(fut, timeout)
+    except TimeoutError:
+        pass
+
+
 async def _wait_standard(
     coordinator: Coordinator,
     resource: Any,
     timeout_seconds: float,
+    notifier: KeyNotifier | None = None,
 ) -> dict[str, Any]:
-    """Async poll loop for standard-mode agenthold_wait."""
+    """Wait for a resource to become free.
+
+    Wakes instantly when a release happens in this process (via the notifier),
+    and otherwise re-checks every ``_POLL_INTERVAL`` so cross-process releases
+    (and TTL expiry / disconnect cleanup, which are not notified) are still seen.
+
+    ``notifier`` defaults to a fresh, unshared instance (pure polling) so direct
+    callers behave exactly as before; the server passes the shared notifier.
+    """
+    if notifier is None:
+        notifier = KeyNotifier()
     try:
         rid = coordinator.canonicalize(resource)
     except ValueError as e:
@@ -1069,68 +1141,79 @@ async def _wait_standard(
         return {"status": "error", "message": "timeout_seconds must be >= 0"}
 
     key = rid.to_uri()
+    notify_key = _wait_key(key)
     start = time.monotonic()
     deadline = start + timeout_seconds
 
     while True:
+        # Subscribe before reading so a release between the read and the wait is
+        # not lost (the future is already registered when notify fires).
+        fut = notifier.subscribe(notify_key)
         try:
-            state = coordinator._interpret_state_by_uri(key)
-        except BusyError:
+            try:
+                state: dict[str, Any] | None = coordinator._interpret_state_by_uri(key)
+            except BusyError:
+                state = None
+
+            if state is not None and state["state"] in (
+                "unclaimed",
+                "free",
+                "expired",
+            ):
+                response: dict[str, Any] = {
+                    "status": "available",
+                    "resource": key,
+                    "elapsed_seconds": round(time.monotonic() - start, 3),
+                }
+                if state["state"] == "free":
+                    outcome = state.get("outcome", "released")
+                    response["previous_outcome"] = outcome
+                    response["previous_holder"] = state.get("released_by", "unknown")
+                    response["previous_outcome_at"] = state.get(
+                        "released_at", "unknown"
+                    )
+                    if outcome == "moved" and state.get("moved_to"):
+                        response["moved_to"] = state["moved_to"]
+                    hint = Coordinator._hint_for_outcome(outcome)
+                    if hint:
+                        response["hint"] = hint
+                elif state["state"] == "expired":
+                    response["previous_outcome"] = "expired"
+                    response["previous_holder"] = state.get("held_by", "unknown")
+                    response["previous_outcome_at"] = state.get("claimed_at", "unknown")
+                    hint = Coordinator._hint_for_outcome("expired")
+                    if hint:
+                        response["hint"] = hint
+                return response
+
             now = time.monotonic()
             if now >= deadline:
+                if state is None:
+                    return {
+                        "status": "timeout",
+                        "resource": key,
+                        "elapsed_seconds": round(now - start, 3),
+                        "hint": (
+                            "Timed out while the database was locked. "
+                            "Retry after a short delay."
+                        ),
+                    }
                 return {
                     "status": "timeout",
                     "resource": key,
+                    "held_by": state.get("held_by", "unknown"),
+                    "claimed_at": state.get("claimed_at", "unknown"),
                     "elapsed_seconds": round(now - start, 3),
                     "hint": (
-                        "Timed out while the database was locked. "
-                        "Retry after a short delay."
+                        "The resource was not released within the timeout. "
+                        "Try working on a different resource, or call "
+                        "agenthold_wait again with a longer timeout."
                     ),
                 }
-            await asyncio.sleep(0.2)
-            continue
 
-        if state["state"] in ("unclaimed", "free", "expired"):
-            response: dict[str, Any] = {
-                "status": "available",
-                "resource": key,
-                "elapsed_seconds": round(time.monotonic() - start, 3),
-            }
-            if state["state"] == "free":
-                outcome = state.get("outcome", "released")
-                response["previous_outcome"] = outcome
-                response["previous_holder"] = state.get("released_by", "unknown")
-                response["previous_outcome_at"] = state.get("released_at", "unknown")
-                if outcome == "moved" and state.get("moved_to"):
-                    response["moved_to"] = state["moved_to"]
-                hint = Coordinator._hint_for_outcome(outcome)
-                if hint:
-                    response["hint"] = hint
-            elif state["state"] == "expired":
-                response["previous_outcome"] = "expired"
-                response["previous_holder"] = state.get("held_by", "unknown")
-                response["previous_outcome_at"] = state.get("claimed_at", "unknown")
-                hint = Coordinator._hint_for_outcome("expired")
-                if hint:
-                    response["hint"] = hint
-            return response
-
-        now = time.monotonic()
-        if now >= deadline:
-            return {
-                "status": "timeout",
-                "resource": key,
-                "held_by": state.get("held_by", "unknown"),
-                "claimed_at": state.get("claimed_at", "unknown"),
-                "elapsed_seconds": round(now - start, 3),
-                "hint": (
-                    "The resource was not released within the timeout. "
-                    "Try working on a different resource, or call "
-                    "agenthold_wait again with a longer timeout."
-                ),
-            }
-
-        await asyncio.sleep(0.2)
+            await _wait_for_notify(fut, min(deadline - now, _POLL_INTERVAL))
+        finally:
+            notifier.unsubscribe(notify_key, fut)
 
 
 # ---------------------------------------------------------------------------
@@ -1354,8 +1437,19 @@ async def _watch(
     key: str,
     since_version: int,
     timeout_seconds: float,
+    notifier: KeyNotifier | None = None,
 ) -> dict[str, Any]:
-    """Async polling loop. Called directly from call_tool, not via _dispatch."""
+    """Wait for a key's version to exceed ``since_version``.
+
+    Wakes instantly when a write to this key happens in this process (via the
+    notifier), and otherwise re-checks every ``_POLL_INTERVAL`` so cross-process
+    writes are still seen. Called directly from call_tool, not via _dispatch.
+
+    ``notifier`` defaults to a fresh, unshared instance (pure polling) so direct
+    callers behave exactly as before; the server passes the shared notifier.
+    """
+    if notifier is None:
+        notifier = KeyNotifier()
     try:
         _validate_identifier(namespace, "namespace")
         _validate_identifier(key, "key")
@@ -1366,43 +1460,51 @@ async def _watch(
     if timeout_seconds < 0:
         return {"status": "error", "message": "timeout_seconds must be >= 0"}
 
+    notify_key = _watch_key(namespace, key)
     start = time.monotonic()
     deadline = start + timeout_seconds
 
     while True:
+        # Subscribe before reading so a write between the read and the wait is
+        # not lost.
+        fut = notifier.subscribe(notify_key)
         try:
-            record = store.get(namespace, key)
-            if record.version > since_version:
+            try:
+                record = store.get(namespace, key)
+                if record.version > since_version:
+                    return {
+                        "status": "ok",
+                        "namespace": record.namespace,
+                        "key": record.key,
+                        "value": record.value,
+                        "version": record.version,
+                        "updated_by": record.updated_by,
+                        "updated_at": record.updated_at.isoformat(),
+                    }
+            except NotFoundError:
+                pass
+            except BusyError:
+                pass
+
+            now = time.monotonic()
+            if now >= deadline:
                 return {
-                    "status": "ok",
-                    "namespace": record.namespace,
-                    "key": record.key,
-                    "value": record.value,
-                    "version": record.version,
-                    "updated_by": record.updated_by,
-                    "updated_at": record.updated_at.isoformat(),
+                    "status": "timeout",
+                    "namespace": namespace,
+                    "key": key,
+                    "since_version": since_version,
+                    "elapsed_seconds": round(now - start, 3),
+                    "hint": (
+                        "The key did not change within the timeout. "
+                        "Retry with the same since_version, or call agenthold_get "
+                        "to check current state before deciding whether to wait "
+                        "again."
+                    ),
                 }
-        except NotFoundError:
-            pass
-        except BusyError:
-            pass
 
-        now = time.monotonic()
-        if now >= deadline:
-            return {
-                "status": "timeout",
-                "namespace": namespace,
-                "key": key,
-                "since_version": since_version,
-                "elapsed_seconds": round(now - start, 3),
-                "hint": (
-                    "The key did not change within the timeout. "
-                    "Retry with the same since_version, or call agenthold_get "
-                    "to check current state before deciding whether to wait again."
-                ),
-            }
-
-        await asyncio.sleep(0.2)
+            await _wait_for_notify(fut, min(deadline - now, _POLL_INTERVAL))
+        finally:
+            notifier.unsubscribe(notify_key, fut)
 
 
 # ---------------------------------------------------------------------------
