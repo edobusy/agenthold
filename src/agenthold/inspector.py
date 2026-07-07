@@ -93,14 +93,22 @@ def register_subcommands(subparsers: Any) -> None:
 
 def run(args: argparse.Namespace) -> int:
     """Run an inspector subcommand. Returns a process exit code."""
+    # Never abort on a character the terminal cannot encode (e.g. an emoji in
+    # an agent-supplied name on a legacy Windows console): escape it instead.
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if reconfigure is not None:
+        reconfigure(errors="backslashreplace")
+
     db = args.db
     if db != ":memory:" and not Path(db).exists():
         print(f"error: database not found at {db!r}", file=sys.stderr)
         return 1
 
+    # read_only=True never mutates the target file (no schema/journal writes),
+    # so pointing --db at the wrong file cannot corrupt it.
     try:
-        store = StateStore(db)
-    except sqlite3.Error as e:
+        store = StateStore(db, read_only=True)
+    except (sqlite3.Error, OSError) as e:
         print(f"error: could not open database {db!r}: {e}", file=sys.stderr)
         return 1
     try:
@@ -119,6 +127,10 @@ def run(args: argparse.Namespace) -> int:
         return 1
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
+        return 1
+    except sqlite3.Error as e:
+        # e.g. a valid SQLite file that isn't an agenthold database.
+        print(f"error: not a readable agenthold database {db!r}: {e}", file=sys.stderr)
         return 1
     finally:
         store.close()
@@ -323,10 +335,14 @@ def _load_agent_names(store: StateStore) -> dict[str, str]:
     return names
 
 
-def _age(iso: str) -> str:
-    """Render an ISO timestamp as a compact age like '3m ago'."""
-    if not iso:
-        return ""
+def _age(iso: object) -> str:
+    """Render an ISO timestamp as a compact age like '3m ago'.
+
+    Defensive against malformed/legacy records: a non-string or unparseable
+    value is rendered verbatim rather than raising.
+    """
+    if not isinstance(iso, str) or not iso:
+        return str(iso) if iso else ""
     try:
         then = datetime.fromisoformat(iso)
     except ValueError:

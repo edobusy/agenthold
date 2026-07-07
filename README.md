@@ -456,8 +456,10 @@ agent that disconnects is automatically reclaimable.
 
 An agenthold database is just a SQLite file, but you rarely want to open it by
 hand. The `agenthold` command doubles as a **read-only inspector** so you can see
-what agents are doing at a glance — no MCP client required. These commands never
-modify the store.
+what agents are doing at a glance — no MCP client required. These commands are
+strictly read-only (the database is opened with `query_only` and no schema
+writes), so they never modify the store — even if you point `--db` at the wrong
+file.
 
 ```bash
 agenthold agents --db ./state.db          # who is registered

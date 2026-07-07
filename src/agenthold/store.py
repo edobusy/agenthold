@@ -108,8 +108,11 @@ class StateStore:
       lock and does not block writers in other processes.
     """
 
-    def __init__(self, db_path: str | Path = ":memory:") -> None:
+    def __init__(
+        self, db_path: str | Path = ":memory:", *, read_only: bool = False
+    ) -> None:
         self.db_path = str(db_path)
+        self.read_only = read_only
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(
             self.db_path,
@@ -117,6 +120,14 @@ class StateStore:
             isolation_level=None,  # autocommit on; BEGIN/COMMIT managed explicitly
         )
         self._conn.row_factory = sqlite3.Row
+        if read_only:
+            # Inspection mode: never mutate the target database. Skip the
+            # journal-mode switch and all schema creation/migration DDL, and
+            # set query_only so any accidental write is rejected. This reads
+            # both WAL and rollback-journal databases without changing them.
+            self._conn.execute("PRAGMA query_only=ON")
+            self._conn.execute("PRAGMA busy_timeout=5000")
+            return
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute("PRAGMA foreign_keys=ON")

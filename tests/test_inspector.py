@@ -293,7 +293,113 @@ def test_corrupt_db_errors_cleanly(
     db.write_bytes(b"this is not a sqlite database")
     rc = _run(["agents", "--db", str(db)])
     assert rc == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error:") and "database" in err
+
+
+def test_foreign_sqlite_db_errors_cleanly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A valid SQLite file that is not an agenthold database.
+    import sqlite3
+
+    db = tmp_path / "foreign.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute("CREATE TABLE unrelated (x)")
+    conn.commit()
+    conn.close()
+    before = db.read_bytes()
+
+    rc = _run(["agents", "--db", str(db)])
+    assert rc == 1
+    assert "not a readable agenthold database" in capsys.readouterr().err
+    # The foreign database must not have been modified (no schema written).
+    assert db.read_bytes() == before
+
+
+def test_inspecting_does_not_mutate_db(tmp_path: Path) -> None:
+    import hashlib
+
+    db = tmp_path / "state.db"
+    _populate(db)
+    digest = hashlib.sha256(db.read_bytes()).hexdigest()
+    for argv in (["agents"], ["claims", "--all"], ["namespaces"], ["keys", "orders"]):
+        assert _run([*argv, "--db", str(db)]) == 0
+    assert hashlib.sha256(db.read_bytes()).hexdigest() == digest
+
+
+def test_agents_non_ascii_name_does_not_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import io
+    import sys
+
+    db = tmp_path / "u.db"
+    store = StateStore(str(db))
+    registry = WorkspaceRegistry([Workspace(name="default", root="/work")])
+    Coordinator(store, registry).register(name="robot-\U0001f916")
+    store.close()
+
+    # Simulate a legacy console that cannot encode the emoji.
+    buffer = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", newline="")
+    monkeypatch.setattr(sys, "stdout", buffer)
+    rc = inspector.run(srv._build_arg_parser().parse_args(["agents", "--db", str(db)]))
+    assert rc == 0  # backslashreplace kept it from raising UnicodeEncodeError
+
+
+def test_agents_non_string_last_activity_does_not_crash(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = tmp_path / "m.db"
+    store = StateStore(str(db))
+    # Legacy/malformed agent record with a numeric last_activity.
+    store.set(
+        "_agents",
+        "agent-legacy",
+        {"name": "old", "status": "active", "last_activity": 12345},
+        updated_by="agent-legacy",
+    )
+    store.close()
+    rc = _run(["agents", "--db", str(db)])
+    assert rc == 0
+    assert "agent-legacy" in capsys.readouterr().out
+
+
+def test_history_newest_first(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = tmp_path / "h.db"
+    store = StateStore(str(db))
+    store.set("orders", "o1", "v1", updated_by="a", expected_version=0)
+    store.set("orders", "o1", "v2", updated_by="a", expected_version=1)
+    store.set("orders", "o1", "v3", updated_by="a", expected_version=2)
+    store.close()
+    _run(["history", "orders", "o1", "--db", str(db), "--json"])
+    data = json.loads(capsys.readouterr().out)
+    assert [e["version"] for e in data] == [3, 2, 1]
+
+
+def test_db_path_is_directory_errors(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    directory = tmp_path / "adir"
+    directory.mkdir()
+    rc = _run(["agents", "--db", str(directory)])
+    assert rc == 1
     assert "could not open database" in capsys.readouterr().err
+
+
+def test_read_only_store_rejects_writes(tmp_path: Path) -> None:
+    import sqlite3
+
+    db = tmp_path / "ro.db"
+    StateStore(str(db)).close()  # create the schema in read-write mode
+    ro = StateStore(str(db), read_only=True)
+    try:
+        with pytest.raises(sqlite3.Error):
+            ro.set("ns", "k", "v", updated_by="x", expected_version=0)
+    finally:
+        ro.close()
 
 
 def test_run_unknown_command_defensive(

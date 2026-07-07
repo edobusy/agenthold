@@ -25,7 +25,14 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     invocation) still starts the MCP server exactly as before — the inspector is
     purely additive.
   - Inspecting a database path that does not exist prints a clear error and
-    exits non-zero **without** creating an empty database.
+    exits non-zero **without** creating an empty database. Genuinely read-only:
+    the store is opened with `PRAGMA query_only` and no schema/journal writes,
+    so pointing `--db` at the wrong file (or a non-agenthold SQLite file) reports
+    a clean error and leaves that file byte-for-byte unchanged. Non-ASCII values
+    in agent names never crash text output on a legacy console.
+- **`StateStore(..., read_only=True)`**: opens a connection that performs no
+  schema creation/migration and rejects writes (`PRAGMA query_only`), for safe
+  inspection of a live or foreign database.
 - **`StateStore.list_namespaces()`**: read-only helper returning the distinct
   namespaces that hold live records (used by `agenthold namespaces`).
 
