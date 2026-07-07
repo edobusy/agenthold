@@ -645,3 +645,47 @@ def test_migration_no_op_on_current_db(store: StateStore) -> None:
     store._migrate_event_type()
     cols = {r["name"] for r in store._conn.execute("PRAGMA table_info(state_history)")}
     assert "event_type" in cols
+
+
+class _ExecInterceptor:
+    """Wraps a sqlite3 connection so a callback can intercept execute()."""
+
+    def __init__(self, conn: object, intercept: object) -> None:
+        self._conn = conn
+        self._intercept = intercept
+
+    def execute(self, sql: str, *args: object) -> object:
+        return self._intercept(sql, self._conn.execute, *args)  # type: ignore[attr-defined]
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._conn, name)
+
+
+def test_migration_swallows_duplicate_column_race(store: StateStore) -> None:
+    """When two processes migrate one old DB at once, the losing ALTER hits
+    'duplicate column name' — it must be swallowed, not crash. Forced here by
+    making the PRAGMA report the column absent so the ALTER runs against the
+    already-present column."""
+
+    def intercept(sql: str, real, *args):  # type: ignore[no-untyped-def]
+        if "table_info" in sql:
+            return iter([])
+        return real(sql, *args)
+
+    store._conn = _ExecInterceptor(store._conn, intercept)  # type: ignore[assignment]
+    store._migrate_event_type()  # must not raise
+
+
+def test_migration_reraises_non_duplicate_error(store: StateStore) -> None:
+    import sqlite3
+
+    def intercept(sql: str, real, *args):  # type: ignore[no-untyped-def]
+        if "table_info" in sql:
+            return iter([])
+        if sql.strip().upper().startswith("ALTER"):
+            raise sqlite3.OperationalError("database is locked")
+        return real(sql, *args)
+
+    store._conn = _ExecInterceptor(store._conn, intercept)  # type: ignore[assignment]
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        store._migrate_event_type()

@@ -225,7 +225,9 @@ def _standard_tools() -> list[Tool]:
                 "The returned agent_id is your identity for this session "
                 "— use it in all subsequent agenthold_claim and "
                 "agenthold_release calls. "
-                "Do not call this more than once per session."
+                "Do not call this more than once per session. "
+                "If the response status is 'unavailable', the database was "
+                "briefly locked — retry after a short delay."
             ),
             inputSchema={
                 "type": "object",
@@ -339,7 +341,9 @@ def _standard_tools() -> list[Tool]:
                 "holder did something significant (deleted, moved, etc.). "
                 "Call agenthold_claim to secure it before editing. "
                 '"claimed": Another agent holds this resource. The '
-                "response tells you who and when."
+                "response tells you who and when. "
+                '"unavailable": The database was briefly locked (transient); '
+                "retry after a short delay."
             ),
             inputSchema={
                 "type": "object",
@@ -1778,8 +1782,8 @@ def _validate_config_or_exit(args: argparse.Namespace) -> list[Workspace]:
     try:
         workspaces = _build_workspaces(args.workspace)
         WorkspaceRegistry(workspaces)  # validates names, uniqueness, roots
-        if args.claim_ttl is not None and args.claim_ttl <= 0:
-            raise ValueError("claim_ttl must be > 0")
+        if args.claim_ttl is not None and not args.claim_ttl > 0:
+            raise ValueError("claim_ttl must be a positive number")
     except ValueError as e:
         raise SystemExit(f"error: {e}") from e
     return workspaces

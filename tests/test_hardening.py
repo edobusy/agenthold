@@ -106,6 +106,34 @@ def test_coordination_busy_still_reports_busy_with_holder() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_claim_conflict_lock_returns_unavailable() -> None:
+    # A conflict during claim where the re-read is DB-locked: cannot name a
+    # holder, so 'unavailable' (retry), not a holderless 'busy'.
+    coord = _coord()
+    with patch.object(coord._store, "get", side_effect=BusyError()):
+        result = coord._handle_claim_conflict("custom://x")
+    assert result["status"] == "unavailable"
+
+
+def test_claim_conflict_malformed_value_returns_unavailable() -> None:
+    coord = _coord()
+    coord._store.set("claims", "custom://y", "not-a-claim", updated_by="z")
+    result = coord._handle_claim_conflict("custom://y")
+    assert result["status"] == "unavailable"
+
+
+def test_claim_conflict_real_holder_returns_busy_with_held_by() -> None:
+    coord = _coord()
+    coord._store.set(
+        "claims",
+        "custom://z",
+        {"status": "claimed", "by": "agent-1", "at": "t"},
+        updated_by="agent-1",
+    )
+    result = coord._handle_claim_conflict("custom://z")
+    assert result["status"] == "busy" and result["held_by"] == "agent-1"
+
+
 def test_release_by_wrong_agent_reports_held_by_and_hint() -> None:
     coord = _coord()
     a = coord.register(name="a")["agent_id"]

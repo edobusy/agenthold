@@ -168,9 +168,12 @@ class WorkspaceRegistry:
             if hay == needle:
                 return ws, ""
             if hay.startswith(needle + "/"):
-                # Remainder is taken from the original-case path; the caller
-                # folds it via Workspace.fold when building the key.
-                return ws, norm[len(root) + 1 :]
+                # Slice the SAME (compared) string so the offset is always
+                # correct even if casefold changes a character's length; for a
+                # case-insensitive workspace the remainder comes back folded,
+                # which is exactly what the key needs (Workspace.fold is
+                # idempotent on it).
+                return ws, hay[len(needle) + 1 :]
         return None
 
 

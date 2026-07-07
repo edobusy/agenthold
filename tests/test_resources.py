@@ -272,6 +272,15 @@ class TestBareRelativePath:
         rid = parse_resource_input("/PROJ/Src/App.py", reg)
         assert rid.to_uri() == "file://default/src/app.py"
 
+    def test_case_insensitive_root_with_length_changing_fold(self) -> None:
+        # 'ß' casefolds to 'ss' (length change): the remainder must still be
+        # sliced correctly (regression guard for the longest_match offset).
+        reg = WorkspaceRegistry(
+            [Workspace(name="w", root="/proß", case_sensitive=False)]
+        )
+        rid = parse_resource_input("/PROSS/sub/x.py", reg)
+        assert rid.to_uri() == "file://w/sub/x.py"
+
 
 class TestBareRelativeNoDefault:
     def test_rejects_when_no_default(self, multi_registry: WorkspaceRegistry) -> None:
