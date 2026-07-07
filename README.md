@@ -452,6 +452,38 @@ agent that disconnects is automatically reclaimable.
 
 ---
 
+## Inspecting the store
+
+An agenthold database is just a SQLite file, but you rarely want to open it by
+hand. The `agenthold` command doubles as a **read-only inspector** so you can see
+what agents are doing at a glance — no MCP client required. These commands never
+modify the store.
+
+```bash
+agenthold agents --db ./state.db          # who is registered
+agenthold claims --db ./state.db          # what is currently claimed, and by whom
+agenthold claims --db ./state.db --all    # also show freed/moved/deleted claims
+agenthold namespaces --db ./state.db      # namespaces + record counts
+agenthold keys orders --db ./state.db     # keys in a namespace
+agenthold history orders order-1 --db ./state.db   # a key's version history
+```
+
+Example:
+
+```
+$ agenthold claims --db ./state.db
+RESOURCE                    STATE    BY            SINCE
+--------------------------  -------  ------------  ------
+custom://chapter-1          claimed  editor-agent  2s ago
+file://default/src/main.py  claimed  review-bot    2s ago
+```
+
+Every command accepts `--db PATH` (default `./agenthold.db`) and `--json` for
+machine-readable output. A bare `agenthold` (no subcommand) still starts the MCP
+server exactly as before — the inspector is purely additive.
+
+---
+
 ## Development
 
 ```bash

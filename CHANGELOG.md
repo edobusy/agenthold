@@ -7,6 +7,30 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.7.0] - 2026-07-07
+
+### Added
+- **CLI inspector**: read-only subcommands to look inside an agenthold store
+  without going through MCP — the fastest way to see whether coordination is
+  working. All are read-only and never mutate the store:
+  - `agenthold agents` — registered agents (id, name, model, status, last activity)
+  - `agenthold claims [--all]` — current resource claims and who holds them;
+    `--all` also shows freed/released entries with their outcome
+  - `agenthold namespaces` — namespaces present, with a record count each
+  - `agenthold keys NAMESPACE` — keys in a namespace with version + last-write
+  - `agenthold history NAMESPACE KEY [--limit N]` — a key's version history
+  - Every command takes `--db PATH` (default `./agenthold.db`) and `--json` for
+    machine-readable output.
+  - A bare `agenthold` (or any `agenthold --db … --tools … --transport …`
+    invocation) still starts the MCP server exactly as before — the inspector is
+    purely additive.
+  - Inspecting a database path that does not exist prints a clear error and
+    exits non-zero **without** creating an empty database.
+- **`StateStore.list_namespaces()`**: read-only helper returning the distinct
+  namespaces that hold live records (used by `agenthold namespaces`).
+
+---
+
 ## [0.6.0] - 2026-07-07
 
 ### Added

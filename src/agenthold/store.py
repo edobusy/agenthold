@@ -300,6 +300,19 @@ class StateStore:
             for r in rows
         ]
 
+    def list_namespaces(self) -> list[str]:
+        """Return the distinct namespaces that currently hold live records.
+
+        Read-only; sorted alphabetically. Namespaces whose every record has been
+        deleted do not appear (only live records are considered). Returns an
+        empty list for an empty store.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT namespace FROM state_records ORDER BY namespace"
+            ).fetchall()
+        return [r["namespace"] for r in rows]
+
     def history(
         self, namespace: str, key: str, limit: int = 10
     ) -> list[StateRecordHistory]:
