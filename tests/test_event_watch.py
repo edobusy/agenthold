@@ -32,20 +32,37 @@ def _coord() -> tuple[StateStore, object]:
 # ---------------------------------------------------------------------------
 
 
-async def test_watch_wakes_on_notify_not_poll(
+async def _wait_until_parked(notifier: KeyNotifier, key: str) -> None:
+    """Block until a waiter has subscribed on ``key`` (bounded)."""
+    for _ in range(200):
+        if key in notifier._waiters:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"waiter never parked on {key!r}")
+
+
+async def test_watch_wakes_specifically_on_notify(
     monkeypatch: pytest.MonkeyPatch, store: StateStore
 ) -> None:
+    # Airtight isolation of the notify as the wake cause: prove the watcher is
+    # parked (already read v1), then that committing v2 alone does NOT wake it
+    # (poll is 30 s away), then that the notify does.
     monkeypatch.setattr(srv, "_POLL_INTERVAL", 30.0)
     store.set("ns", "k", "v0", updated_by="a")  # version 1
     notifier = KeyNotifier()
+    notify_key = srv._watch_key("ns", "k")
     task = asyncio.create_task(
         srv._watch(
             store, "ns", "k", since_version=1, timeout_seconds=30.0, notifier=notifier
         )
     )
-    await asyncio.sleep(0.05)  # let it read v1 and start waiting
-    store.set("ns", "k", "v2", updated_by="a", expected_version=1)  # version 2
-    notifier.notify(srv._watch_key("ns", "k"))
+    await _wait_until_parked(notifier, notify_key)  # read v1, subscribed
+    store.set(
+        "ns", "k", "v2", updated_by="a", expected_version=1
+    )  # committed, no notify
+    await asyncio.sleep(0.05)
+    assert not task.done()  # the write alone did not wake it (poll is 30 s off)
+    notifier.notify(notify_key)  # the only thing that can wake it now
     result = await asyncio.wait_for(task, timeout=2.0)
     assert result["status"] == "ok" and result["version"] == 2
 
@@ -124,17 +141,23 @@ async def test_watch_conflict_does_not_notify(
 # ---------------------------------------------------------------------------
 
 
-async def test_wait_wakes_on_release_notify(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_wait_wakes_specifically_on_release_notify(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Airtight: parked -> release commits but does not wake -> notify wakes.
     monkeypatch.setattr(srv, "_POLL_INTERVAL", 30.0)
     store, coord = _coord()
     agent = coord.register(name="a")["agent_id"]  # type: ignore[attr-defined]
     coord.claim("custom://r", agent)  # type: ignore[attr-defined]
     notifier = KeyNotifier()
+    notify_key = srv._wait_key(coord.canonicalize("custom://r").to_uri())  # type: ignore[attr-defined]
     task = asyncio.create_task(
         srv._wait_standard(coord, "custom://r", timeout_seconds=30.0, notifier=notifier)
     )
-    await asyncio.sleep(0.05)
+    await _wait_until_parked(notifier, notify_key)
     coord.release("custom://r", agent, outcome="modified")  # type: ignore[attr-defined]
+    await asyncio.sleep(0.05)
+    assert not task.done()  # release alone did not wake it (poll is 30 s off)
     srv._notify_after_standard(
         notifier,
         coord,
