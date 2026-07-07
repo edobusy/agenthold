@@ -62,6 +62,7 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
+from agenthold import inspector
 from agenthold.coordinator import Coordinator
 from agenthold.exceptions import BusyError, ConflictError, NotFoundError
 from agenthold.resources import (
@@ -1519,11 +1520,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "(localhost-friendly default). Only used with --transport http."
         ),
     )
+    # Read-only inspector subcommands. A bare invocation (no subcommand) leaves
+    # command=None and runs the MCP server, preserving backward compatibility.
+    subparsers = parser.add_subparsers(dest="command")
+    inspector.register_subcommands(subparsers)
     return parser
 
 
 def main() -> None:  # pragma: no cover
     args = _build_arg_parser().parse_args()
+    if getattr(args, "command", None) is not None:
+        raise SystemExit(inspector.run(args))
     workspaces = _build_workspaces(args.workspace)
     if args.transport == "http":
         asyncio.run(
