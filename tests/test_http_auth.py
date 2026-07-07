@@ -251,6 +251,18 @@ async def test_multiple_tokens_each_authorizes(
         assert (await _post(url, token="gamma")).status_code == 401
 
 
+async def test_advanced_mode_is_also_gated(registry: WorkspaceRegistry) -> None:
+    # The gate lives at the transport layer, so advanced tools are gated too.
+    store = StateStore(":memory:")
+    coord = Coordinator(store, registry)
+    app = srv.build_http_app(
+        store, coord, registry, "advanced", auth_tokens=frozenset({"secret"})
+    )
+    async with _serve(app) as url:
+        assert (await _post(url, token=None)).status_code == 401
+        assert (await _post(url, token="secret")).status_code != 401
+
+
 async def test_valid_token_full_flow(registry: WorkspaceRegistry) -> None:
     async with _serve(_app(registry, frozenset({"s3cr3t"}))) as url:
         async with httpx.AsyncClient(
