@@ -7,6 +7,31 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.9.0] - 2026-07-07
+
+### Changed
+- **`agenthold_watch` and `agenthold_wait` now wake instantly** on a change made
+  in the same server process, instead of waiting out the poll interval. When one
+  agent's `agenthold_set` bumps a watched key's version, or an `agenthold_release`
+  frees a waited-on resource, any waiter connected to the same server is woken
+  immediately (typically sub-millisecond) rather than after up to 200 ms. This is
+  most impactful under the HTTP transport, where a single long-lived server hosts
+  many agents.
+- A bounded polling fallback (unchanged 200 ms cadence) is kept underneath, so
+  cross-process changes (stdio, or multiple servers sharing one database) and
+  changes that aren't directly notified (deletes, TTL expiry, disconnect cleanup)
+  are still observed with no latency regression versus previous releases.
+- Tool schemas, response shapes, and timeout semantics are unchanged.
+
+### Internal
+- New `agenthold/notifier.py` (`KeyNotifier`): a small in-process, event-loop-only
+  wakeup registry. Notifications are best-effort latency optimisation layered on
+  the polling loop, which remains the source of correctness — a missed
+  notification only means a fall back to polling, never a hang or wrong result.
+  The `StateStore` stays a pure, synchronous, asyncio-free layer.
+
+---
+
 ## [0.8.0] - 2026-07-07
 
 ### Added

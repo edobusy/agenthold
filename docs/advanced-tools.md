@@ -207,7 +207,9 @@ Records are sorted alphabetically by key. History entries are ordered newest fir
 
 ## `agenthold_watch`
 
-Wait for a key's version to change, then return the new value. Polls every 200 ms.
+Wait for a key's version to change, then return the new value. Returns
+near-instantly when the write happens on the same server, and within ~200 ms for
+changes made by another process (a bounded fallback check).
 
 > **Important:** This call holds the agent turn until it returns. No other actions can be taken while waiting. Only use this when the agent has nothing else to do until the key changes.
 
