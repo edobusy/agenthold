@@ -468,6 +468,11 @@ Tokens are compared in constant time. Authentication applies to `--transport
 http` only (stdio is a trusted local transport). This release is all-or-nothing
 authentication; per-namespace scoping is on the roadmap.
 
+The `AGENTHOLD_AUTH_TOKEN` value is split on commas, so a token itself must not
+contain a comma (use repeated `--auth-token` for such tokens). If authentication
+is requested but every token is blank, the server **refuses to start** rather
+than serving without auth.
+
 > **Security.** Bearer tokens are only as private as the transport carrying them
 > — put **TLS** in front of agenthold (a reverse proxy) for any real deployment.
 > The default bind address is `127.0.0.1` (localhost only); binding beyond

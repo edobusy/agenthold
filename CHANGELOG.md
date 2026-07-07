@@ -21,8 +21,13 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     (`WWW-Authenticate: Bearer`) **before** reaching the MCP session manager or
     the store. Tokens are compared in constant time (`hmac.compare_digest`); the
     scheme is matched case-insensitively per RFC 7235.
-  - Blank/whitespace-only tokens are dropped, so a misconfiguration cannot create
-    an empty-string credential that authorizes everyone.
+  - Each token is trimmed of surrounding whitespace, so the natural
+    `AGENTHOLD_AUTH_TOKEN="tok1, tok2"` spelling works (no stray leading space on
+    the second token). Blank/whitespace-only tokens are dropped so a
+    misconfiguration cannot create an empty-string credential.
+  - **Fails closed:** if authentication is requested (`--auth-token` /
+    `AGENTHOLD_AUTH_TOKEN` present) but every token is blank, the HTTP server
+    refuses to start (exits non-zero) rather than silently serving open.
   - Auth applies to `--transport http` only. Supplying a token with
     `--transport stdio` prints a warning and is otherwise ignored (stdio is a
     local, trusted transport with no network surface).

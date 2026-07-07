@@ -102,6 +102,42 @@ def test_collect_tokens_empty() -> None:
     assert srv._collect_auth_tokens([" "], " , ") == frozenset()
 
 
+def test_collect_tokens_strips_whitespace_around_each() -> None:
+    # The natural "a, b" env spelling must not keep the leading space on b
+    # (a client's trimmed 'Bearer b' header would otherwise never match).
+    assert srv._collect_auth_tokens(None, "tok1, tok2") == frozenset({"tok1", "tok2"})
+    assert srv._collect_auth_tokens(["  abc  "], None) == frozenset({"abc"})
+
+
+def test_resolve_http_auth_fails_closed_when_requested_but_empty() -> None:
+    # Requested (flag/env present) but no usable token -> refuse to start.
+    with pytest.raises(SystemExit):
+        srv._resolve_http_auth(True, frozenset())
+
+
+def test_resolve_http_auth_passes_through() -> None:
+    tokens = frozenset({"t"})
+    assert srv._resolve_http_auth(True, tokens) is tokens
+    # Not requested + empty -> fine, run without auth.
+    assert srv._resolve_http_auth(False, frozenset()) == frozenset()
+
+
+def test_authorized_hostile_bytes_do_not_crash(
+    registry: WorkspaceRegistry,
+) -> None:
+    app = srv._BearerAuthASGIApp(
+        srv._StreamableHTTPASGIApp.__new__(srv._StreamableHTTPASGIApp),
+        frozenset({"secret"}),
+    )
+    scope = {"type": "http", "headers": [(b"authorization", b"Bearer \xff\xfe")]}
+    assert app._authorized(scope) is False  # no UnicodeDecodeError / TypeError
+    # 'Bearer ' with an empty token part must not authorize either.
+    empty = {"type": "http", "headers": [(b"authorization", b"Bearer ")]}
+    assert app._authorized(empty) is False
+    # No Authorization header at all.
+    assert app._authorized({"type": "http", "headers": []}) is False
+
+
 def test_auth_token_arg_parsing() -> None:
     args = srv._build_arg_parser().parse_args(
         ["--transport", "http", "--auth-token", "t1", "--auth-token", "t2"]
@@ -157,6 +193,40 @@ async def test_missing_token_rejected(registry: WorkspaceRegistry) -> None:
 async def test_wrong_token_rejected(registry: WorkspaceRegistry) -> None:
     async with _serve(_app(registry, frozenset({"secret"}))) as url:
         resp = await _post(url, token="not-it")
+        assert resp.status_code == 401
+
+
+async def test_get_stream_also_gated(registry: WorkspaceRegistry) -> None:
+    # The SSE GET endpoint must require the token too, not just POST.
+    async with _serve(_app(registry, frozenset({"secret"}))) as url:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, headers={"Accept": "text/event-stream"})
+        assert resp.status_code == 401
+
+
+async def test_delete_also_gated(registry: WorkspaceRegistry) -> None:
+    # Session-terminate (DELETE) must require the token too.
+    async with _serve(_app(registry, frozenset({"secret"}))) as url:
+        async with httpx.AsyncClient() as client:
+            resp = await client.request("DELETE", url)
+        assert resp.status_code == 401
+
+
+async def test_forged_session_id_without_token_rejected(
+    registry: WorkspaceRegistry,
+) -> None:
+    # A stolen/guessed Mcp-Session-Id must not bypass the token check: auth
+    # runs before any session lookup.
+    async with _serve(_app(registry, frozenset({"secret"}))) as url:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                url,
+                json={},
+                headers={
+                    "Accept": "application/json, text/event-stream",
+                    "Mcp-Session-Id": "deadbeefdeadbeefdeadbeefdeadbeef",
+                },
+            )
         assert resp.status_code == 401
 
 

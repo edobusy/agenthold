@@ -817,14 +817,30 @@ def _collect_auth_tokens(
     never create an empty-string credential that would authorize everyone.
     """
     tokens: set[str] = set()
-    for token in cli_tokens or []:
-        if token.strip():
+    for raw in list(cli_tokens or []) + (env_value.split(",") if env_value else []):
+        token = raw.strip()
+        if token:
             tokens.add(token)
-    if env_value:
-        for token in env_value.split(","):
-            if token.strip():
-                tokens.add(token)
     return frozenset(tokens)
+
+
+def _resolve_http_auth(
+    auth_requested: bool, auth_tokens: frozenset[str]
+) -> frozenset[str]:
+    """Fail closed if auth was asked for but no usable token was found.
+
+    A security gate must never silently serve open: if the operator passed
+    --auth-token / set AGENTHOLD_AUTH_TOKEN but every token was blank after
+    stripping, refuse to start rather than exposing the store unauthenticated.
+    """
+    if auth_requested and not auth_tokens:
+        raise SystemExit(
+            "error: authentication was requested (--auth-token / "
+            f"{_AUTH_ENV_VAR}) but no non-empty token was found. Refusing to "
+            "start without authentication. Provide a non-empty token, or remove "
+            "the flag / unset the env var to run without auth."
+        )
+    return auth_tokens
 
 
 class _BearerAuthASGIApp:
@@ -843,6 +859,10 @@ class _BearerAuthASGIApp:
         self._token_bytes = frozenset(token.encode() for token in tokens)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        # The gate covers HTTP requests (POST/GET/DELETE all flow through here).
+        # The endpoint is mounted as a Starlette Route, which only dispatches
+        # http scopes, so this is the complete surface. If a websocket route is
+        # ever added, it must be gated too.
         if scope["type"] == "http" and not self._authorized(scope):
             await self._reject(send)
             return
@@ -1638,8 +1658,11 @@ def main() -> None:  # pragma: no cover
     if getattr(args, "command", None) is not None:
         raise SystemExit(inspector.run(args))
     workspaces = _build_workspaces(args.workspace)
-    auth_tokens = _collect_auth_tokens(args.auth_token, os.environ.get(_AUTH_ENV_VAR))
+    env_token = os.environ.get(_AUTH_ENV_VAR)
+    auth_requested = bool(args.auth_token) or env_token is not None
+    auth_tokens = _collect_auth_tokens(args.auth_token, env_token)
     if args.transport == "http":
+        auth_tokens = _resolve_http_auth(auth_requested, auth_tokens)
         asyncio.run(
             _run_http(
                 args.db,
