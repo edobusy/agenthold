@@ -442,7 +442,13 @@ agent that disconnects is automatically reclaimable.
 > bind address is `127.0.0.1` (localhost only). Do not expose it on a public
 > interface without putting your own authentication in front of it. Pass
 > `--allowed-host <host>` (repeatable) to enable DNS-rebinding (Host-header)
-> protection when binding beyond localhost.
+> protection when binding beyond localhost. Binding to a non-loopback address
+> prints a startup warning.
+
+> **Long-lived servers.** agenthold does not yet reap idle agent records, so a
+> server that runs for a very long time with high agent churn will accumulate
+> agent metadata. Set `--claim-ttl` (so disconnected agents' claims recover) and
+> restart periodically if needed. Automatic reaping is on the roadmap.
 
 ---
 

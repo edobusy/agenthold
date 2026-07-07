@@ -44,12 +44,14 @@ import argparse
 import asyncio
 import json
 import os
+import sys
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+import anyio
 import uvicorn
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -742,6 +744,13 @@ def _make_server_from_parts(
 
     @server.call_tool()  # type: ignore[untyped-decorator]
     async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+        # The synchronous store dispatch is offloaded to a worker thread so a
+        # slow operation (e.g. a large agenthold_export, or a write waiting on
+        # SQLite's busy_timeout) cannot stall the event loop. Under the HTTP
+        # transport one loop serves every session, so blocking it would freeze
+        # all clients, not just the caller. The store is thread-safe by design
+        # (check_same_thread=False + an internal lock). The async wait/watch
+        # pollers already yield the loop and are left as-is.
         if tools_mode == "advanced":
             if name == "agenthold_watch":
                 result = await _watch(
@@ -752,7 +761,9 @@ def _make_server_from_parts(
                     timeout_seconds=float(arguments.get("timeout_seconds", 10.0)),
                 )
             else:
-                result = _dispatch(store, name, arguments)
+                result = await anyio.to_thread.run_sync(
+                    _dispatch, store, name, arguments
+                )
         else:
             if name == "agenthold_wait":
                 result = await _wait_standard(
@@ -761,7 +772,9 @@ def _make_server_from_parts(
                     timeout_seconds=float(arguments.get("timeout_seconds", 30.0)),
                 )
             else:
-                result = _dispatch_standard(coordinator, name, arguments)
+                result = await anyio.to_thread.run_sync(
+                    _dispatch_standard, coordinator, name, arguments
+                )
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
     return server
@@ -787,6 +800,11 @@ class _StreamableHTTPASGIApp:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         await self._manager.handle_request(scope, receive, send)
+
+
+def _is_loopback_host(host: str) -> bool:
+    """True if the bind address only reaches the local machine."""
+    return host in {"127.0.0.1", "localhost", "::1"}
 
 
 def _security_settings_from_allowed_hosts(
@@ -823,7 +841,12 @@ def build_http_app(
     per connected client. The session manager's task group is established by
     the app's lifespan; on shutdown, standard-mode agent claims are released
     (mirroring the stdio cleanup path).
+
+    ``path`` is normalized to a leading slash so that a bare value such as
+    ``"mcp"`` is accepted rather than raising deep inside Starlette routing.
     """
+    if not path.startswith("/"):
+        path = "/" + path
     server = _make_server_from_parts(store, coordinator, registry, tools_mode)
     manager = StreamableHTTPSessionManager(
         server,
@@ -834,10 +857,14 @@ def build_http_app(
 
     @asynccontextmanager
     async def lifespan(_app: Starlette) -> AsyncIterator[None]:
-        async with manager.run():
-            yield
-        if tools_mode == "standard":
-            _cleanup_agents(coordinator)
+        # try/finally guarantees claim cleanup even if the session manager's
+        # task-group teardown raises during shutdown (mirrors the stdio path).
+        try:
+            async with manager.run():
+                yield
+        finally:
+            if tools_mode == "standard":
+                _cleanup_agents(coordinator)
 
     return Starlette(
         routes=[Route(path, endpoint=_StreamableHTTPASGIApp(manager))],
@@ -1342,6 +1369,15 @@ async def _run_http(  # pragma: no cover
     registry = WorkspaceRegistry(workspaces)
     store = StateStore(db_path)
     coordinator = Coordinator(store, registry, claim_ttl=claim_ttl)
+    if not _is_loopback_host(host) and not allowed_hosts:
+        print(
+            f"WARNING: agenthold HTTP is binding to {host!r}, which is reachable "
+            "beyond this machine. The HTTP transport has no authentication: "
+            "anyone who can reach this address can read and write coordination "
+            "state. Restrict access at the network layer, and pass --allowed-host "
+            "to enable DNS-rebinding protection.",
+            file=sys.stderr,
+        )
     app = build_http_app(
         store,
         coordinator,
@@ -1351,7 +1387,14 @@ async def _run_http(  # pragma: no cover
         json_response=json_response,
         security_settings=_security_settings_from_allowed_hosts(allowed_hosts),
     )
-    config = uvicorn.Config(app, host=host, port=port, log_level="info")
+    config = uvicorn.Config(
+        app,
+        host=host,
+        port=port,
+        log_level="info",
+        lifespan="on",
+        timeout_graceful_shutdown=10,
+    )
     await uvicorn.Server(config).serve()
 
 
@@ -1368,6 +1411,17 @@ def _cleanup_agents(  # pragma: no cover
     for agent_id in coordinator.session_agent_ids:
         coordinator.release_all(agent_id)
         coordinator.deactivate_agent(agent_id)
+
+
+def _port_number(value: str) -> int:
+    """argparse type: parse and range-check a TCP port (0-65535)."""
+    try:
+        port = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"port must be an integer, got {value!r}")
+    if not 0 <= port <= 65535:
+        raise argparse.ArgumentTypeError(f"port must be 0-65535, got {port}")
+    return port
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -1434,9 +1488,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--port",
-        type=int,
+        type=_port_number,
         default=8417,
-        help="HTTP port (default: 8417). Only used with --transport http.",
+        help="HTTP port 0-65535 (default: 8417). Only used with --transport http.",
     )
     parser.add_argument(
         "--path",

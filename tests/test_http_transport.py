@@ -9,6 +9,7 @@ Two levels:
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import socket
@@ -101,6 +102,36 @@ def test_invalid_transport_rejected() -> None:
         srv._build_arg_parser().parse_args(["--transport", "carrier-pigeon"])
 
 
+def test_port_number_valid() -> None:
+    assert srv._port_number("8417") == 8417
+    assert srv._port_number("0") == 0
+    assert srv._port_number("65535") == 65535
+
+
+def test_port_number_out_of_range() -> None:
+    for bad in ("-1", "65536", "99999"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            srv._port_number(bad)
+
+
+def test_port_number_not_integer() -> None:
+    with pytest.raises(argparse.ArgumentTypeError):
+        srv._port_number("not-a-port")
+
+
+def test_parser_rejects_out_of_range_port() -> None:
+    with pytest.raises(SystemExit):
+        srv._build_arg_parser().parse_args(["--transport", "http", "--port", "99999"])
+
+
+def test_is_loopback_host() -> None:
+    assert srv._is_loopback_host("127.0.0.1")
+    assert srv._is_loopback_host("localhost")
+    assert srv._is_loopback_host("::1")
+    assert not srv._is_loopback_host("0.0.0.0")
+    assert not srv._is_loopback_host("192.168.1.5")
+
+
 # ---------------------------------------------------------------------------
 # Security-settings helper
 # ---------------------------------------------------------------------------
@@ -136,6 +167,15 @@ def test_build_http_app_custom_path(registry: WorkspaceRegistry) -> None:
     store, coord = _coordinator(registry)
     app = srv.build_http_app(store, coord, registry, "advanced", path="/rpc")
     assert "/rpc" in [route.path for route in app.routes]  # type: ignore[attr-defined]
+
+
+def test_build_http_app_path_missing_leading_slash_normalized(
+    registry: WorkspaceRegistry,
+) -> None:
+    store, coord = _coordinator(registry)
+    # A bare path (no leading slash) must be normalized, not crash Starlette.
+    app = srv.build_http_app(store, coord, registry, "standard", path="mcp")
+    assert "/mcp" in [route.path for route in app.routes]  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +248,9 @@ async def _serve(app: Starlette, host: str = "127.0.0.1") -> AsyncIterator[str]:
     sock.listen(128)
     port = sock.getsockname()[1]
 
-    config = uvicorn.Config(app, log_level="warning")
+    config = uvicorn.Config(
+        app, log_level="warning", lifespan="on", timeout_graceful_shutdown=10
+    )
     server = uvicorn.Server(config)
     # Signal handlers can only be installed in the main thread of the main
     # interpreter; disable them so serve() works inside the test event loop.
@@ -225,7 +267,10 @@ async def _serve(app: Starlette, host: str = "127.0.0.1") -> AsyncIterator[str]:
         yield f"http://{host}:{port}/mcp"
     finally:
         server.should_exit = True
-        await task
+        try:
+            await asyncio.wait_for(task, timeout=15)
+        except TimeoutError:  # pragma: no cover - teardown safety net
+            task.cancel()
 
 
 async def test_http_standard_end_to_end(registry: WorkspaceRegistry) -> None:
