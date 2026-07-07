@@ -595,3 +595,53 @@ def test_export_namespace_total_history_entries_returned(
     _, entries = store.export_namespace("ns")
     total = sum(len(history) for _, history in entries)
     assert total == 5
+
+
+# ---------------------------------------------------------------------------
+# event_type migration (pre-#5 hardening)
+# ---------------------------------------------------------------------------
+
+
+def test_migration_adds_event_type_to_pre_column_db(tmp_path: object) -> None:
+    """Opening an old DB whose state_history lacks event_type must add the
+    column via the PRAGMA-guarded migration (not swallow a lock as 'migrated')."""
+    import sqlite3
+
+    db = str(tmp_path / "old.db")  # type: ignore[operator]
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE state_records (
+            namespace TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
+            version INTEGER NOT NULL, updated_by TEXT NOT NULL,
+            updated_at TEXT NOT NULL, PRIMARY KEY (namespace, key));
+        CREATE TABLE state_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, namespace TEXT NOT NULL,
+            key TEXT NOT NULL, value TEXT NOT NULL, version INTEGER NOT NULL,
+            updated_by TEXT NOT NULL, updated_at TEXT NOT NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = StateStore(db)
+    cols = {r["name"] for r in store._conn.execute("PRAGMA table_info(state_history)")}
+    assert "event_type" in cols
+    # And it actually works end to end (writes + delete tombstones).
+    store.set("ns", "k", "v", updated_by="a", expected_version=0)
+    store.delete("ns", "k", deleted_by="a", expected_version=1)
+    events = {h.event_type for h in store.history("ns", "k", limit=10)}
+    assert events == {"write", "delete"}
+    store.close()
+
+    # Re-opening is a no-op (idempotent) — the ALTER must not run again.
+    again = StateStore(db)
+    again.close()
+
+
+def test_migration_no_op_on_current_db(store: StateStore) -> None:
+    # A freshly created DB already has event_type; running the migration again
+    # must be a harmless no-op.
+    store._migrate_event_type()
+    cols = {r["name"] for r in store._conn.execute("PRAGMA table_info(state_history)")}
+    assert "event_type" in cols

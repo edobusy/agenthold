@@ -774,14 +774,15 @@ class TestClaimTTLInit:
     def test_negative_ttl_raises(
         self, store: StateStore, registry: WorkspaceRegistry
     ) -> None:
-        with pytest.raises(ValueError, match="claim_ttl must be >= 0"):
+        with pytest.raises(ValueError, match="claim_ttl must be > 0"):
             Coordinator(store, registry, claim_ttl=-1.0)
 
-    def test_zero_ttl_allowed(
+    def test_zero_ttl_raises(
         self, store: StateStore, registry: WorkspaceRegistry
     ) -> None:
-        coord = Coordinator(store, registry, claim_ttl=0.0)
-        assert coord._claim_ttl == 0.0
+        # 0 would make every claim instantly reclaimable — reject it.
+        with pytest.raises(ValueError, match="claim_ttl must be > 0"):
+            Coordinator(store, registry, claim_ttl=0.0)
 
     def test_none_ttl_allowed(
         self, store: StateStore, registry: WorkspaceRegistry

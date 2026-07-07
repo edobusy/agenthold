@@ -8,6 +8,8 @@ agenthold --db ./state.db --tools advanced
 
 This gives agents direct access to the versioned state store with full OCC conflict detection. No server instructions are sent in this mode.
 
+> **Transient locks.** Any of these tools may return `{"status": "unavailable", ...}` with a `hint` when the SQLite database is briefly write-locked by another writer. This is not an error and not a conflict — simply retry the same call after a short delay.
+
 [← Back to main README](../README.md)
 
 ---

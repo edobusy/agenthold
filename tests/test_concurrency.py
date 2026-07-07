@@ -220,8 +220,9 @@ def test_busy_error_from_store_raises_busy_error(db_path: Path) -> None:
 
 
 def test_dispatch_busy_error_returns_structured_response() -> None:
-    """When the store raises BusyError, _dispatch must return a
-    structured response with status='busy' and a hint."""
+    """When the store raises BusyError, _dispatch must return a structured
+    'unavailable' (transient-lock) response with a hint — distinct from the
+    coordination 'busy' status (which means a peer holds the resource)."""
     store = StateStore(":memory:")
     store.set("ns", "k", "v", updated_by="a")
 
@@ -241,7 +242,7 @@ def test_dispatch_busy_error_returns_structured_response() -> None:
                 "expected_version": 1,
             },
         )
-    assert result["status"] == "busy"
+    assert result["status"] == "unavailable"
     assert "hint" in result
     assert "message" in result
 

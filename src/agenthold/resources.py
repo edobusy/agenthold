@@ -23,9 +23,10 @@ The WorkspaceRegistry is built from the server's --workspace flags.
 from __future__ import annotations
 
 import re
+import sys
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 DEFAULT_WORKSPACE_NAME = "default"
 _WORKSPACE_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
@@ -38,11 +39,29 @@ _MAX_RESOURCE_LEN = 400  # input length cap; URI fits comfortably under store's 
 # ---------------------------------------------------------------------------
 
 
+def _default_case_sensitive() -> bool:
+    """Default filesystem case-sensitivity for the running platform.
+
+    Windows and macOS default to case-insensitive filesystems (so 'Main.py'
+    and 'main.py' are the same file); most others are case-sensitive. This is a
+    heuristic — a per-workspace override could be exposed later for the unusual
+    configurations (case-sensitive APFS, ext4 casefold mounts, etc.).
+    """
+    return sys.platform not in ("win32", "darwin")
+
+
 class Workspace(BaseModel):
     """A configured workspace (logical name + absolute filesystem root)."""
 
     name: str
     root: str  # absolute path; backslashes accepted but normalized internally
+    # When False, 'Main.py' and 'main.py' canonicalize to the same key so two
+    # agents cannot both claim the same physical file on a case-insensitive FS.
+    case_sensitive: bool = Field(default_factory=_default_case_sensitive)
+
+    def fold(self, path: str) -> str:
+        """Case-fold a path for this workspace if its filesystem is insensitive."""
+        return path if self.case_sensitive else path.casefold()
 
 
 class ResourceId(BaseModel):
@@ -142,11 +161,16 @@ class WorkspaceRegistry:
         norm = abs_path.replace("\\", "/")
         for ws in self._by_root_length:
             root = _normalize_root(ws.root)
-            if norm == root:
+            # Match case-insensitively for case-insensitive workspaces so an
+            # absolute path whose drive/root case differs still resolves.
+            hay = norm if ws.case_sensitive else norm.casefold()
+            needle = root if ws.case_sensitive else root.casefold()
+            if hay == needle:
                 return ws, ""
-            if norm.startswith(root + "/"):
-                remainder = norm[len(root) + 1 :]
-                return ws, remainder
+            if hay.startswith(needle + "/"):
+                # Remainder is taken from the original-case path; the caller
+                # folds it via Workspace.fold when building the key.
+                return ws, norm[len(root) + 1 :]
         return None
 
 
@@ -192,7 +216,7 @@ def _parse_file_uri(rest: str, registry: WorkspaceRegistry) -> ResourceId:
         raise ValueError(
             f"file URI {f'file://{workspace_name}/'!r} must include a non-empty path"
         )
-    canonical_path = _normalize_relative_path(path_str)
+    canonical_path = workspace.fold(_normalize_relative_path(path_str))
     return ResourceId(scope="file", workspace=workspace.name, path=canonical_path)
 
 
@@ -226,7 +250,7 @@ def _parse_bare_path(raw: str, registry: WorkspaceRegistry) -> ResourceId:
                 "trailing path component; agenthold coordinates resources, not "
                 "the workspace itself."
             )
-        canonical_path = _normalize_relative_path(remainder)
+        canonical_path = ws.fold(_normalize_relative_path(remainder))
         return ResourceId(scope="file", workspace=ws.name, path=canonical_path)
 
     # Relative bare path — needs a default workspace
@@ -238,7 +262,7 @@ def _parse_bare_path(raw: str, registry: WorkspaceRegistry) -> ResourceId:
             f"none is configured. Available workspaces: {available}. "
             "Pass a 'file://<workspace>/<path>' URI to be explicit."
         )
-    canonical_path = _normalize_relative_path(raw)
+    canonical_path = default.fold(_normalize_relative_path(raw))
     return ResourceId(scope="file", workspace=default.name, path=canonical_path)
 
 

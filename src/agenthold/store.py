@@ -132,14 +132,25 @@ class StateStore:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
-        # Migration: add event_type to databases that predate this column.
-        try:
+        self._migrate_event_type()
+
+    def _migrate_event_type(self) -> None:
+        """Add the event_type column to state_history if it predates that column.
+
+        Decides via PRAGMA table_info rather than ALTER-and-catch, so a
+        transient lock during the ALTER surfaces as an error instead of being
+        mistaken for 'already migrated' — which would leave the column missing
+        and break every subsequent write.
+        """
+        columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(state_history)")
+        }
+        if "event_type" not in columns:
             self._conn.execute(
                 "ALTER TABLE state_history "
                 "ADD COLUMN event_type TEXT NOT NULL DEFAULT 'write'"
             )
-        except sqlite3.OperationalError:
-            pass  # Column already exists — db already migrated or just created
 
     @contextmanager
     def _transaction(self) -> Generator[sqlite3.Connection, None, None]:

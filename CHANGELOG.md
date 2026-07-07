@@ -7,6 +7,53 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.10.0] - 2026-07-07
+
+Hardening batch from a full-codebase audit, ahead of the next coordination
+feature.
+
+### Fixed
+- **Same-file double-claim on case-insensitive filesystems.** On Windows and
+  macOS, `src/Main.py` and `src/main.py` are the same file but used to
+  canonicalize to two different keys, so two agents could each "successfully"
+  claim it and edit concurrently — exactly the corruption agenthold prevents.
+  File-scope resources now canonicalize case-insensitively on case-insensitive
+  platforms (`custom://` names are unaffected). `Workspace` gains a
+  `case_sensitive` field defaulting to the platform (`False` on Windows/macOS).
+- **Transient DB-locks no longer masquerade as coordination `busy`.** A brief
+  SQLite write-lock previously returned `status:"busy"`, which
+  `agenthold_claim` documents as "another agent holds this resource" — so an
+  agent would abandon a resource it should have retried. Transient locks now
+  return a distinct **`status:"unavailable"`** (retryable, with a hint) across
+  all tools; `busy` now means only "a peer holds this claim" (and carries
+  `held_by`).
+- **`agenthold_release` errors are now actionable:** a transient release
+  conflict carries a `hint` to retry, and the wrong-agent error carries a
+  structured `held_by`.
+- **`--allowed-host` no longer silences the "no authentication" warning.**
+  DNS-rebinding protection is not authentication; binding beyond localhost
+  without `--auth-token` now warns regardless of `--allowed-host`.
+- **`--claim-ttl 0` is rejected** (it made every claim instantly reclaimable);
+  TTL must be `> 0`.
+- **Config errors are clean messages, not tracebacks.** Bad `--workspace`
+  values, duplicate workspace names, an invalid `--claim-ttl`, or an unopenable
+  `--db` now print `error: …` and exit non-zero.
+- **HTTP-only flags warn under stdio.** Setting `--host/--port/--path/
+  --json-response/--allowed-host` with the default stdio transport now prints a
+  warning instead of being silently ignored.
+- **Schema migration no longer swallows lock errors.** The `event_type` column
+  migration now checks `PRAGMA table_info` instead of catching every
+  `OperationalError`, so a transient lock during migration can't be mistaken for
+  "already migrated" (which would have left the column missing).
+
+### Notes
+Two deeper items from the audit are tracked as separate follow-ups, not in this
+release: OCC version-identity across delete+recreate (an ABA edge in the advanced
+`set`/`delete` tools), and binding `agent_id` to its session (a claim can be
+released by any agent that knows the public holder id).
+
+---
+
 ## [0.9.0] - 2026-07-07
 
 ### Changed

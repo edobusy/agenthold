@@ -82,8 +82,9 @@ class Coordinator:
         registry: WorkspaceRegistry,
         claim_ttl: float | None = None,
     ) -> None:
-        if claim_ttl is not None and claim_ttl < 0:
-            raise ValueError("claim_ttl must be >= 0")
+        if claim_ttl is not None and claim_ttl <= 0:
+            # 0 would make every claim instantly reclaimable — reject it.
+            raise ValueError("claim_ttl must be > 0")
         self._store = store
         self._registry = registry
         self._claim_ttl = claim_ttl
@@ -490,6 +491,11 @@ class Coordinator:
             return {
                 "status": "error",
                 "message": (f"Resource is claimed by {value.get('by')}, not {agent}"),
+                "held_by": value.get("by"),
+                "hint": (
+                    "You do not hold this claim; only the holder can release it. "
+                    "Do not retry with your agent_id."
+                ),
             }
 
         free_value: dict[str, Any] = {
@@ -519,6 +525,9 @@ class Coordinator:
                     ),
                     "current_version": current.version,
                     "current_value": current.value,
+                    "hint": (
+                        "Transient conflict — re-read status and retry the release."
+                    ),
                 }
             except NotFoundError:
                 return {"status": "not_found", "resource": key}
